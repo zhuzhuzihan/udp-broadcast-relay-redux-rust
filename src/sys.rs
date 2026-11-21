@@ -389,9 +389,67 @@ pub fn join6(fd: i32, group: [u8; 16], ifindex: u32) -> Result<(), ()> {
     }
 }
 
+/// Socket-level IPV6_MULTICAST_HOPS (used by the degraded bare-sendto path).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn setsockopt6_multicast_hops(fd: i32, hops: i32) -> Result<(), std::io::Error> {
+    // SAFETY: int-valued IPv6 option on our own socket.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MULTICAST_HOPS,
+            std::ptr::addr_of!(hops).cast::<libc::c_void>(),
+            size_of::<i32>() as u32,
+        )
+    };
+    if rc < 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Bare sendto on a raw IPv6 socket (no ancillary data): source/hop limit and
+/// interface come from socket options and the destination scope_id.
+pub fn sendto6(
+    fd: i32,
+    seg: &[u8],
+    dst: [u8; 16],
+    port: u16,
+    ifindex: u32,
+) -> Result<usize, std::io::Error> {
+    // SAFETY: sockaddr_in6 fully initialized; seg lives across the call.
+    let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    sa.sin6_port = port.to_be();
+    sa.sin6_addr = libc::in6_addr { s6_addr: dst };
+    sa.sin6_scope_id = ifindex;
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            seg.as_ptr().cast(),
+            seg.len(),
+            0,
+            &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+            size_of::<libc::sockaddr_in6>() as u32,
+        )
+    };
+    if rc < 0 {
+        Err(last_error())
+    } else {
+        Ok(rc as usize)
+    }
+}
+
 /// sendmsg on a raw IPv6 socket: the kernel builds the IPv6 header (Linux has
 /// no full-header mode for AF_INET6 raw); source address, outgoing interface
 /// and hop limit come from IPV6_PKTINFO / IPV6_HOPLIMIT ancillary data.
+/// `with_source=false` omits the source address (kernel default selection) —
+/// some kernels reject local-mismatch sources with EINVAL.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ancillary data carries source/hop/ifindex"
+)]
 pub fn sendmsg6(
     fd: i32,
     seg: &[u8],
@@ -400,6 +458,7 @@ pub fn sendmsg6(
     hop_limit: u8,
     src: [u8; 16],
     ifindex: u32,
+    with_source: bool,
 ) -> Result<usize, std::io::Error> {
     // SAFETY: every pointed-to buffer is initialized and outlives sendmsg.
     let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
@@ -422,13 +481,15 @@ pub fn sendmsg6(
         cmsg[*off + 16..*off + 16 + data.len()].copy_from_slice(data);
         *off += padded;
     };
-    let pktinfo = libc::in6_pktinfo {
-        ipi6_addr: libc::in6_addr { s6_addr: src },
-        ipi6_ifindex: ifindex,
-    };
-    // SAFETY: plain POD struct copy.
-    let pkt_bytes: [u8; 20] = unsafe { std::mem::transmute(pktinfo) };
-    put(&mut off, libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &pkt_bytes);
+    if with_source {
+        let pktinfo = libc::in6_pktinfo {
+            ipi6_addr: libc::in6_addr { s6_addr: src },
+            ipi6_ifindex: ifindex,
+        };
+        // SAFETY: plain POD struct copy.
+        let pkt_bytes: [u8; 20] = unsafe { std::mem::transmute(pktinfo) };
+        put(&mut off, libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &pkt_bytes);
+    }
     put(
         &mut off,
         libc::IPPROTO_IPV6,

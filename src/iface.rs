@@ -301,7 +301,10 @@ pub fn setup(
                         out::perror("setsockopt IP_TRANSPARENT", out::errno());
                     }
                 }
-                let _ = &fd;
+                // Socket-level hop limit for the degraded bare-sendto path.
+                if sys::setsockopt6_multicast_hops(fd.0, i32::from(ttl)).is_err() {
+                    out::perror("setsockopt IPV6_MULTICAST_HOPS", out::errno());
+                }
                 Some(fd)
             }
             Err(_) => {

@@ -329,7 +329,12 @@ fn relay_one6(
             opts.port,
             &gram[crate::packet::V6HEADER_LEN..crate::packet::V6HEADER_LEN + len],
         );
-        match sys::sendmsg6(
+        // Degradation chain for picky kernels (some reject PKTINFO sources or
+        // all ancillary data on raw IPv6 sockets):
+        //   1. PKTINFO(source, ifindex) + HOPLIMIT
+        //   2. PKTINFO(unspecified source, ifindex) + HOPLIMIT
+        //   3. bare sendto with destination scope_id + socket-level hops
+        let sent = sys::sendmsg6(
             raw6.0,
             &seg,
             group,
@@ -337,7 +342,22 @@ fn relay_one6(
             ttl,
             src_addr,
             iface.ifindex as u32,
-        ) {
+            true,
+        )
+        .or_else(|_| {
+            sys::sendmsg6(
+                raw6.0,
+                &seg,
+                group,
+                opts.port,
+                ttl,
+                [0u8; 16],
+                iface.ifindex as u32,
+                false,
+            )
+        })
+        .or_else(|_| sys::sendto6(raw6.0, &seg, group, opts.port, iface.ifindex as u32));
+        match sent {
             Ok(_) => {
                 stats
                     .forwarded
