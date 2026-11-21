@@ -2,14 +2,18 @@
 //! the C original including its quirks (last-match interface lookup, echo
 //! detection by TTL, perror without exit on sendto failures).
 
+use crate::cli;
 use crate::cli::{Options, INADDR_BROADCAST, SPOOF_IFACE_BCAST_PORT, SPOOF_IFACE_SRC_PORT};
+use crate::event::{self, Action, ManagedInfo};
 use crate::i18n::{ipv4_str, I18n};
+use crate::iface;
 use crate::iface::Iface;
 use crate::out::{self, Out};
 use crate::packet::{forge, GRAM_SIZE, HEADER_LEN};
 use crate::signal::{Signals, SIG_HUP, SIG_INT, SIG_TERM, SIG_USR1};
 use crate::stats::Stats;
 use crate::sys;
+use std::collections::HashSet;
 
 /// Control buffer size, as in the original (`u_char pkt_infos[16384]`).
 const CTRL_SIZE: usize = 16384;
@@ -49,20 +53,22 @@ fn cmsg_iter(ctrl: &[u8]) -> Vec<(i32, i32, &[u8])> {
 )]
 pub fn run(
     opts: &Options,
-    ifaces: &[Iface],
+    ifaces: &mut Vec<Iface>,
     rcv: &sys::Fd,
     gram: &mut [u8; GRAM_SIZE],
     out_stream: &mut Out,
     t: &I18n,
     signals: &Signals,
     stats: &Stats,
+    joined: &mut HashSet<(u32, u32)>,
+    netlink: Option<&sys::Fd>,
 ) {
     let ttl = opts.id + crate::packet::TTL_ID_OFFSET;
     let mut ctrl = [0u8; CTRL_SIZE];
     let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
 
-    // poll set: [0] = receiver, [1] = signal self-pipe. (netlink/v6 join later waves)
-    let mut pollfds = [
+    // poll set: [0] = receiver, [1] = signal self-pipe, [2] = netlink (opt).
+    let mut pollfds = vec![
         libc::pollfd {
             fd: rcv.0,
             events: libc::POLLIN,
@@ -74,6 +80,16 @@ pub fn run(
             revents: 0,
         },
     ];
+    if let Some(nl) = netlink {
+        pollfds.push(libc::pollfd {
+            fd: nl.0,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    const IDX_RCV: usize = 0;
+    const IDX_SIG: usize = 1;
+    const IDX_NL: usize = 2;
 
     loop {
         match sys::poll(&mut pollfds, -1) {
@@ -81,7 +97,7 @@ pub fn run(
             Err(_) => continue, // EINTR etc.: retry, like the original's `len <= 0`
         }
 
-        if pollfds[1].revents & libc::POLLIN != 0 {
+        if pollfds[IDX_SIG].revents & libc::POLLIN != 0 {
             let mut shutdown = false;
             for tag in signals.drain() {
                 match tag {
@@ -98,7 +114,30 @@ pub fn run(
             }
         }
 
-        if pollfds[0].revents & libc::POLLIN != 0 {
+        if let (true, Some(nl)) = (pollfds[IDX_NL].revents & libc::POLLIN != 0, netlink) {
+            // SAFETY: netlink fd is live and poll declared it readable.
+            let mut buf = [0u8; 8192];
+            let n = unsafe { libc::recv(nl.0, buf.as_mut_ptr().cast(), buf.len(), 0) };
+            if n > 0 {
+                let managed: std::collections::BTreeMap<i32, ManagedInfo> = ifaces
+                    .iter()
+                    .map(|i| {
+                        (
+                            i.ifindex,
+                            ManagedInfo {
+                                name: i.name.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                for ev in event::parse(&buf[..n as usize]) {
+                    let actions = event::decide(&opts.interfaces, &managed, &ev);
+                    apply_actions(&actions, ifaces, opts, rcv.0, joined, t, out_stream);
+                }
+            }
+        }
+
+        if pollfds[IDX_RCV].revents & libc::POLLIN != 0 {
             // Receive a broadcast packet (payload goes straight into the gram,
             // like the original's iovec pointing at gram + HEADER_LEN).
             let payload = &mut gram[HEADER_LEN..HEADER_LEN + crate::packet::MAX_PAYLOAD];
@@ -127,6 +166,79 @@ pub fn run(
                 stats,
             );
         }
+    }
+}
+
+/// Execute hot-plug actions: probe + create + join for Add, close for Remove.
+fn apply_actions(
+    actions: &[Action],
+    ifaces: &mut Vec<Iface>,
+    opts: &Options,
+    rcv_fd: i32,
+    joined: &mut HashSet<(u32, u32)>,
+    t: &I18n,
+    out_stream: &mut Out,
+) {
+    for act in actions {
+        match act {
+            Action::Add(name) => {
+                if ifaces.iter().any(|i| i.name == *name) {
+                    continue;
+                }
+                let ttl = opts.id + crate::packet::TTL_ID_OFFSET;
+                let added = sys::udp_socket().ok().and_then(|tmp| {
+                    iface::setup(tmp.0, name, ttl, opts.debug, out_stream, t)
+                        .ok()
+                        .flatten()
+                });
+                if let Some(iface) = added {
+                    for m in &opts.multicast {
+                        let multi = cli::inet_addr(m);
+                        if !joined.insert((multi, iface.ifaddr)) {
+                            continue;
+                        }
+                        if join_group(rcv_fd, multi, iface.ifaddr).is_err() {
+                            out::perror("IP_ADD_MEMBERSHIP on rcv", out::errno());
+                        }
+                    }
+                    out::eprint_raw(&t.iface_added(name));
+                    ifaces.push(iface);
+                }
+            }
+            Action::Remove(idx) => {
+                if let Some(pos) = ifaces.iter().position(|i| i.ifindex == *idx) {
+                    let removed = ifaces.remove(pos);
+                    out::eprint_raw(&t.iface_removed(&removed.name));
+                }
+            }
+        }
+    }
+}
+
+/// IP_ADD_MEMBERSHIP on the receive socket (shared by startup and hot-plug).
+fn join_group(fd: i32, multi: u32, ifaddr: u32) -> Result<(), ()> {
+    let mreq = libc::ip_mreq {
+        imr_multiaddr: libc::in_addr {
+            s_addr: multi.swap_bytes(),
+        },
+        imr_interface: libc::in_addr {
+            s_addr: ifaddr.swap_bytes(),
+        },
+    };
+    // SAFETY: mreq is fully initialized; IP_ADD_MEMBERSHIP reads it inline.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_ADD_MEMBERSHIP,
+            &mreq as *const libc::ip_mreq as *const libc::c_void,
+            std::mem::size_of::<libc::ip_mreq>() as u32,
+        )
+    };
+    if rc < 0 {
+        Err(())
+    } else {
+        Ok(())
     }
 }
 

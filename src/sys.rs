@@ -276,6 +276,34 @@ pub fn close(fd: &mut Fd) {
     fd.close();
 }
 
+/// NETLINK_ROUTE socket subscribed to link / IPv4-address groups (Linux).
+#[cfg(target_os = "linux")]
+pub fn netlink_route(groups: u32) -> Result<Fd, std::io::Error> {
+    // SAFETY: socket(2) with constant arguments.
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: sockaddr_nl zeroed then every real field initialized.
+    let mut sa: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    sa.nl_pid = 0;
+    sa.nl_groups = groups;
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
+    };
+    if rc < 0 {
+        let e = last_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(Fd(fd))
+}
+
 /// poll(2): wait for readiness on the given fds. Returns the ready count.
 pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> Result<usize, std::io::Error> {
     // SAFETY: fds is a valid, correctly-sized slice for the call.

@@ -170,9 +170,19 @@ pub fn probe(fd: i32, name: &str) -> Result<Candidate, ProbeError> {
     })
 }
 
+/// Setup failure kinds. `MissingDev` means "interface does not exist (yet)" —
+/// the caller may defer it to the netlink monitor; `Fatal` means the perror
+/// line was already written and the caller must exit like the original.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupErr {
+    MissingDev,
+    Fatal,
+}
+
 /// Set up one managed interface; `Ok(None)` = skipped (down or loopback).
-/// `Err(())` = fatal: the perror line has already been written, the caller
+/// `Err(Fatal)` = the perror line has already been written, the caller
 /// flushes and exits 1 — preserving the original's output order.
+/// `Err(MissingDev)` = ENODEV, perror suppressed for the deferral path.
 pub fn setup(
     tmp_fd: i32,
     name: &str,
@@ -180,18 +190,25 @@ pub fn setup(
     debug: bool,
     out_stream: &mut Out,
     t: &I18n,
-) -> Result<Option<Iface>, ()> {
-    let c = probe(tmp_fd, name).map_err(|e| out::perror(e.label, e.errno))?;
+) -> Result<Option<Iface>, SetupErr> {
+    let c = probe(tmp_fd, name).map_err(|e| {
+        if e.label == "ioctl(SIOCGIFINDEX)" && e.errno == libc::ENODEV {
+            SetupErr::MissingDev
+        } else {
+            out::perror(e.label, e.errno);
+            SetupErr::Fatal
+        }
+    })?;
     if c.skip_reason.is_some() {
         return Ok(None);
     }
     let Some(ifaddr) = c.ifaddr else {
         out::perror("ioctl(SIOCGIFADDR)", c.ifaddr_errno);
-        return Err(());
+        return Err(SetupErr::Fatal);
     };
     let Some(dstaddr) = c.dstaddr else {
         out::perror("ioctl(SIOCGIFBRDADDR)", c.dstaddr_errno);
-        return Err(());
+        return Err(SetupErr::Fatal);
     };
 
     if debug {
@@ -265,9 +282,9 @@ pub fn setup(
     }))
 }
 
-fn fatal_perror<T>(prefix: &str) -> Result<T, ()> {
+fn fatal_perror<T>(prefix: &str) -> Result<T, SetupErr> {
     out::perror(prefix, out::errno());
-    Err(())
+    Err(SetupErr::Fatal)
 }
 
 /// `if_nametoindex` (BSD/macOS fallback used by probe).

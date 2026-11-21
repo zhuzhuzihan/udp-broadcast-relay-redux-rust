@@ -339,6 +339,20 @@ impl I18n {
         }
     }
 
+    pub fn iface_added(&self, name: &str) -> String {
+        match self.lang {
+            Lang::En => format!("interface added: {name}\n"),
+            Lang::Zh => format!("接口已加入：{name}\n"),
+        }
+    }
+
+    pub fn iface_removed(&self, name: &str) -> String {
+        match self.lang {
+            Lang::En => format!("interface removed: {name}\n"),
+            Lang::Zh => format!("接口已移除：{name}\n"),
+        }
+    }
+
     pub fn shutdown(&self) -> String {
         match self.lang {
             Lang::En => "shutting down\n".to_string(),

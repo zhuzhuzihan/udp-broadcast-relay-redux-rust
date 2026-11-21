@@ -11,6 +11,7 @@
 //! GPL-2.0-or-later (see LICENSE).
 
 mod cli;
+mod event;
 mod i18n;
 mod iface;
 mod log;
@@ -142,9 +143,14 @@ fn main() {
         }
     };
 
-    // Set up one raw sending socket per requested interface.
+    // Set up one raw sending socket per requested interface. An interface
+    // that does not exist at all (ENODEV) is deferred to the netlink monitor
+    // when at least one other interface is usable (hot-plug workflow,
+    // documented deviation #5); if every requested interface is missing, the
+    // original's fatal behavior is preserved.
     let mut ifaces: Vec<iface::Iface> = Vec::new();
     let mut seen_idx = HashSet::new();
+    let mut fatal_missing: Vec<String> = Vec::new();
     for name in &dev_names {
         match iface::setup(tmp_fd.0, name, ttl, opts.debug, &mut out_stream, &t) {
             Ok(Some(iface)) => {
@@ -157,12 +163,26 @@ fn main() {
                 }
             }
             Ok(None) => {} // down or loopback: silently skipped
-            Err(()) => {
+            Err(iface::SetupErr::MissingDev) => {
+                // Interface not present at startup: defer to the netlink
+                // monitor when at least one other interface is usable.
+                fatal_missing.push(name.clone());
+            }
+            Err(iface::SetupErr::Fatal) => {
                 // perror already written; exit like the original.
                 out_stream.flush();
                 std::process::exit(1);
             }
         }
+    }
+    // Every requested interface missing → the original's behavior (one
+    // ENODEV perror per interface, then exit). Mixed case → defer.
+    if ifaces.is_empty() && !fatal_missing.is_empty() {
+        for _name in &fatal_missing {
+            out::perror("ioctl(SIOCGIFINDEX)", libc::ENODEV);
+        }
+        out_stream.flush();
+        std::process::exit(1);
     }
 
     if opts.debug {
@@ -179,14 +199,21 @@ fn main() {
 
     sys::close(&mut tmp_fd);
 
-    // Broadcast receiving socket.
-    let rcv = match setup_receiver(&opts, &ifaces, &mut out_stream, &t) {
-        Ok(rcv) => rcv,
+    // Broadcast receiving socket (+ the joined-membership table).
+    let (rcv, mut joined) = match setup_receiver(&opts, &ifaces, &mut out_stream, &t) {
+        Ok(v) => v,
         Err(()) => {
             out_stream.flush();
             std::process::exit(1);
         }
     };
+
+    // Hot-plug monitoring (Linux): follow link/IPv4-address changes so the
+    // managed set tracks reality instead of a one-shot startup snapshot.
+    #[cfg(target_os = "linux")]
+    let netlink = sys::netlink_route((libc::RTMGRP_LINK | libc::RTMGRP_IPV4_IFADDR) as u32).ok();
+    #[cfg(not(target_os = "linux"))]
+    let netlink: Option<sys::Fd> = None;
 
     if opts.debug {
         out_stream.print(&t.debug_done());
@@ -219,13 +246,15 @@ fn main() {
     let mut gram = packet::new_gram();
     relay::run(
         &opts,
-        &ifaces,
+        &mut ifaces,
         &rcv,
         &mut gram,
         &mut out_stream,
         &t,
         &signals,
         &stats,
+        &mut joined,
+        netlink.as_ref(),
     );
 }
 
@@ -238,7 +267,7 @@ fn setup_receiver(
     ifaces: &[iface::Iface],
     out_stream: &mut Out,
     t: &I18n,
-) -> Result<sys::Fd, ()> {
+) -> Result<(sys::Fd, std::collections::HashSet<(u32, u32)>), ()> {
     let rcv = match sys::udp_socket() {
         Ok(fd) => fd,
         Err(_) => return fatal_perror("socket"),
@@ -328,10 +357,10 @@ fn setup_receiver(
         out::eprint_raw(&t.rcv_bind());
         return Err(());
     }
-    Ok(rcv)
+    Ok((rcv, joined))
 }
 
-fn fatal_perror(prefix: &str) -> Result<sys::Fd, ()> {
+fn fatal_perror<T>(prefix: &str) -> Result<T, ()> {
     out::perror(prefix, out::errno());
     Err(())
 }
