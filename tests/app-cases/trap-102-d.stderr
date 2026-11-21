@@ -1,1 +1,1 @@
-ioctl(SIOCGIFADDR): Cannot assign requested address
+invalid port: -7 (expected 1-65535)

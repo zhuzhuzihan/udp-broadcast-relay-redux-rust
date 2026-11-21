@@ -297,6 +297,20 @@ impl I18n {
         }
     }
 
+    pub fn invalid_id(&self, v: &str) -> String {
+        match self.lang {
+            Lang::En => format!("invalid id: {v} (expected 1-99)\n"),
+            Lang::Zh => format!("无效的 id：{v}（应为 1-99）\n"),
+        }
+    }
+
+    pub fn invalid_port(&self, v: &str) -> String {
+        match self.lang {
+            Lang::En => format!("invalid port: {v} (expected 1-65535)\n"),
+            Lang::Zh => format!("无效的端口：{v}（应为 1-65535）\n"),
+        }
+    }
+
     pub fn no_interfaces(&self) -> String {
         match self.lang {
             Lang::En => "no usable interfaces found\n".to_string(),

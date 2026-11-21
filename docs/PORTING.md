@@ -56,7 +56,29 @@ passed 207/207.
 - The `ioctl(SIOCGIFBRDADDR)` perror label is printed even when the
   `SIOCGIFDSTADDR` call fails (copy-paste bug in the original).
 
-## 4. Documented deviations
+## 3b. Intentional deviations introduced in v1.1 (user-approved)
+
+These change recorded original behavior on purpose; each affected case in
+`tests/app-cases/` was re-recorded against the new binary and reflects the
+current contract:
+
+1. **Strict argument parsing (ADR-010)** — the original's u8/u16 truncation
+   quirks (`--id 300` → id 44, `--port 99999` → 34463, `--port -1` → 65535)
+   are replaced by clear bilingual errors (`invalid id: … (expected 1-99)`,
+   `invalid port: … (expected 1-65535)`). 141 recorded cases updated; the
+   remaining 65 stay byte-frozen. The post-loop "missing id/port" messages
+   (`ID argument 0 not between 1 and 99` for a never-given `--id`) are kept
+   verbatim from the original.
+2. **Zero-interface fail-fast** — `--dev` candidates that all end up skipped
+   (down/loopback/no-address) now exit 1 with `no usable interfaces found`
+   instead of binding and waiting forever. 7 recorded `-f … --dev lo` cases
+   updated (exit 0 → exit 1).
+3. **Duplicate suppression** — repeated `--dev` names (or aliases resolving
+   to the same ifindex) and repeated multicast joins no longer forward
+   duplicates or crash with EADDRINUSE; a stderr note is emitted instead.
+4. **Graceful signals** — SIGTERM/SIGINT now exit 0 with `shutting down`.
+
+## 4. Documented deviations (inherited from the original)
 
 - Missing flag value at end of argv (`-s`, `--id`, … with no next argument):
   the C original dereferences NULL and crashes; the port treats it as the

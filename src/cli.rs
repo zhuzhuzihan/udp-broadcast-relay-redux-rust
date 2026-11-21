@@ -12,9 +12,30 @@ pub const SPOOF_IFACE_BCAST_PORT: u32 = 0x0101_0101; // 1.1.1.1
 /// Magic spoof value: outgoing interface address + original source port.
 pub const SPOOF_IFACE_SRC_PORT: u32 = 0x0101_0102; // 1.1.1.2
 
+/// Strict decimal number: pure ASCII digits, no sign/whitespace/empty, value
+/// within `min..=max`. Replaces the original's atoi-truncation quirks
+/// (intentional deviation, ADR-010 / docs/PORTING.md).
+fn parse_strict_num(s: &str, min: u64, max: u64) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for b in s.bytes() {
+        v = v.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+        if v > max {
+            return None;
+        }
+    }
+    if v < min {
+        return None;
+    }
+    Some(v)
+}
+
 /// C `atoi`: `int strtol(const char*, ...)` cast to int.
 /// - skips isspace (" \t\n\v\f\r"), optional +/- sign, then base-10 digits;
 /// - value saturates at LONG_MAX/LONG_MIN like strtol, then truncates to int.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn c_atoi(s: &str) -> i32 {
     let b = s.as_bytes();
     let mut i = 0usize;
@@ -265,16 +286,26 @@ pub fn parse(
         } else if a == "--id" {
             i += 1;
             let v = value_at(args, i);
-            // C: u_char id = atoi(argv[i]) — u8 truncation before the check.
-            opts.id = c_atoi(v) as u8;
+            match parse_strict_num(v, 1, 99) {
+                Some(id) => opts.id = id as u8,
+                None => {
+                    out::eprint_raw(&t.invalid_id(v));
+                    return Err(1);
+                }
+            }
             if debug {
                 out_stream.print(&t.debug_id_set(u32::from(opts.id)));
             }
         } else if a == "--port" {
             i += 1;
             let v = value_at(args, i);
-            // C: u_int16_t port = atoi(argv[i]) — u16 truncation before the check.
-            opts.port = c_atoi(v) as u16;
+            match parse_strict_num(v, 1, 65535) {
+                Some(p) => opts.port = p as u16,
+                None => {
+                    out::eprint_raw(&t.invalid_port(v));
+                    return Err(1);
+                }
+            }
             if debug {
                 out_stream.print(&t.debug_port_set(u32::from(opts.port)));
             }
@@ -308,7 +339,28 @@ pub fn parse(
 mod tests {
     use super::*;
 
-    // Expected values measured against glibc (see docs/PORTING.md probe table).
+    #[test]
+    fn strict_numbers() {
+        assert_eq!(parse_strict_num("1", 1, 99), Some(1));
+        assert_eq!(parse_strict_num("99", 1, 99), Some(99));
+        assert_eq!(parse_strict_num("0", 1, 99), None);
+        assert_eq!(parse_strict_num("100", 1, 99), None);
+        assert_eq!(parse_strict_num("abc", 1, 99), None);
+        assert_eq!(parse_strict_num("", 1, 99), None);
+        assert_eq!(parse_strict_num(" 5", 1, 99), None);
+        assert_eq!(parse_strict_num("-5", 1, 99), None);
+        assert_eq!(parse_strict_num("+5", 1, 99), None);
+        assert_eq!(parse_strict_num("99999", 1, 65535), None);
+        assert_eq!(parse_strict_num("65535", 1, 65535), Some(65535));
+        assert_eq!(parse_strict_num("0", 1, 65535), None);
+        // glibc-truncation values must now be REJECTED (ADR-010)
+        assert_eq!(parse_strict_num("300", 1, 99), None);
+        assert_eq!(parse_strict_num("99999999999999999999999", 1, 65535), None);
+    }
+
+    // Historical: values measured against glibc before strict parsing
+    // (see docs/PORTING.md probe table). The quirks are intentionally gone.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[test]
     fn atoi_matches_glibc() {
         assert_eq!(c_atoi("0"), 0);

@@ -1,1 +1,1 @@
-ioctl(SIOCGIFINDEX): No such device
+invalid port: 99999 (expected 1-65535)
