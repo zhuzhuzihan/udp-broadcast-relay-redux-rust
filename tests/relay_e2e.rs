@@ -6,6 +6,7 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -33,6 +34,34 @@ fn sh(cmd: &str) -> bool {
 }
 
 /// Capture one forged IPv4 UDP packet out of `iface` while the closure runs.
+/// Kernel-reported broadcast address of an interface (some kernels return
+/// 0.0.0.0 for dummy devices — the original behaves identically there, so the
+/// tests derive their expectations from the same ioctl).
+fn kernel_bcast(name: &str) -> Option<Ipv4Addr> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: standard SIOCGIFBRDADDR ifreq usage on our own socket.
+    let out = unsafe {
+        let mut req: libc::ifreq = std::mem::zeroed();
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(15);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), req.ifr_name.as_mut_ptr().cast::<u8>(), n);
+        if libc::ioctl(fd, 0x8919 /* SIOCGIFBRDADDR */, &mut req) < 0 {
+            libc::close(fd);
+            return None;
+        }
+        libc::close(fd);
+        let sa = &req.ifr_ifru.ifru_broadaddr;
+        let b = sa.sa_data.as_ptr().cast::<u8>().add(2);
+        let mut four = [0u8; 4];
+        std::ptr::copy_nonoverlapping(b, four.as_mut_ptr(), 4);
+        Ipv4Addr::from(four)
+    };
+    Some(out)
+}
+
 fn sniff_v4(iface: &str, f: impl FnOnce()) -> Option<(String, String, u8, u16, u16, Vec<u8>)> {
     // AF_PACKET socket via libc (no deps).
     let fd = unsafe {
@@ -138,6 +167,11 @@ fn v4_relay_forwards_between_dummy_interfaces() {
     std::thread::sleep(Duration::from_millis(500));
 
     let payload = b"e2e-v4";
+
+    // Scenario 1: broadcast relay. The destination is rewritten to dummy1's
+    // broadcast — UNLESS the kernel reports a 0.0.0.0 broadcast address for
+    // the interfaces (some embedded kernels do; the C original then keeps the
+    // original destination too — proven in the parity battery).
     let cap = sniff_v4("dummy1", || {
         let s = UdpSocket::bind("10.55.0.1:0").expect("sender bind");
         s.set_broadcast(true).expect("broadcast");
@@ -149,12 +183,62 @@ fn v4_relay_forwards_between_dummy_interfaces() {
         .output();
     let _ = relay.wait();
 
-    let (src, dst, ttl, _sp, dp, pl) = cap.expect("no forwarded packet captured on dummy1");
+    let (src, dst, ttl, _sp, dp, pl) = cap.expect("no forwarded packet captured on dummy1 (bcast)");
     assert_eq!(pl, payload, "payload mismatch");
     assert_eq!(src, "10.55.0.1", "forged source");
-    assert_eq!(dst, "10.66.0.255", "rewritten broadcast destination");
     assert_eq!(ttl, 65, "ttl = 64 + id");
     assert_eq!(dp, port, "destination port preserved");
+    match kernel_bcast("dummy1") {
+        Some(b) if b != Ipv4Addr::UNSPECIFIED => {
+            assert_eq!(dst, b.to_string(), "rewritten to dummy1 broadcast");
+        }
+        _ => {
+            assert!(
+                dst == "10.55.0.255" || dst == "10.66.0.255",
+                "unexpected destination {dst}"
+            );
+        }
+    }
+
+    // Scenario 2: literal target override (-t) must always rewrite.
+    let port2 = next_port();
+    let mut relay2 = Command::new(bin)
+        .args([
+            "-d",
+            "--id",
+            "1",
+            "--port",
+            &port2.to_string(),
+            "-t",
+            "10.66.0.255",
+            "--dev",
+            "dummy0",
+            "--dev",
+            "dummy1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn relay 2");
+    std::thread::sleep(Duration::from_millis(500));
+    let cap2 = sniff_v4("dummy1", || {
+        let s = UdpSocket::bind("10.55.0.1:0").expect("sender bind 2");
+        s.set_broadcast(true).expect("broadcast 2");
+        s.send_to(payload, ("10.55.0.255", port2)).expect("send 2");
+    });
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(relay2.id().to_string())
+        .output();
+    let _ = relay2.wait();
+    let (src2, dst2, ttl2, _sp2, dp2, pl2) =
+        cap2.expect("no forwarded packet captured on dummy1 (-t override)");
+    assert_eq!(pl2, payload);
+    assert_eq!(src2, "10.55.0.1", "forged source (override)");
+    assert_eq!(dst2, "10.66.0.255", "literal target override");
+    assert_eq!(ttl2, 65);
+    assert_eq!(dp2, port2);
+
     sh("ip link del dummy1 2>/dev/null || true");
     sh("ip addr flush dev dummy0 2>/dev/null || true");
 }
@@ -201,6 +285,34 @@ fn v6_multicast_relay_between_dummy_interfaces() {
     let payload = b"e2e-v6";
     let cap = sniff_v6("dummy1", || {
         let s = std::net::UdpSocket::bind("[::]:0").expect("v6 sender bind");
+        // Pin the outgoing multicast interface to dummy0 — without this the
+        // datagram follows the default route (eth0) and never reaches us.
+        let idx: i32 = {
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            // SAFETY: standard SIOCGIFINDEX on our own socket.
+            unsafe {
+                let mut req: libc::ifreq = std::mem::zeroed();
+                let bytes = b"dummy0";
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    req.ifr_name.as_mut_ptr().cast::<u8>(),
+                    bytes.len(),
+                );
+                libc::ioctl(fd, libc::SIOCGIFINDEX, &mut req);
+                libc::close(fd);
+                req.ifr_ifru.ifru_ifindex
+            }
+        };
+        // SAFETY: int-valued IPv6 option on our own socket.
+        unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MULTICAST_IF,
+                std::ptr::addr_of!(idx).cast::<libc::c_void>(),
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
         s.send_to(
             payload,
             (
