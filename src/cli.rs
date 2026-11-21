@@ -198,13 +198,31 @@ pub fn inet_addr(s: &str) -> u32 {
     inet_aton(s).unwrap_or(INADDR_NONE)
 }
 
+/// A multicast group: IPv4 (numeric form) or IPv6 (16 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McastGroup {
+    V4(u32),
+    V6([u8; 16]),
+}
+
+impl std::fmt::Display for McastGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McastGroup::V4(v) => write!(f, "{}", crate::i18n::ipv4_str(*v)),
+            McastGroup::V6(g) => write!(f, "{}", std::net::Ipv6Addr::from(*g)),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Options {
     pub debug: bool,
     pub forking: bool,
     pub port: u16,
     pub id: u8,
-    pub multicast: Vec<String>,
+    pub multicast: Vec<McastGroup>,
+    /// Dual-stack switch: also listen/relay on IPv6 (`--ipv6`).
+    pub ipv6: bool,
     pub interfaces: Vec<String>,
     /// Numeric source address; 0 = use the original sender.
     pub spoof: u32,
@@ -314,7 +332,23 @@ pub fn parse(
             opts.interfaces.push(value_at(args, i).to_string());
         } else if a == "--multicast" {
             i += 1;
-            opts.multicast.push(value_at(args, i).to_string());
+            let v = value_at(args, i);
+            // Groups containing ':' are IPv6 (strict parse — new, no legacy);
+            // everything else goes through the glibc-compatible v4 parser,
+            // whose failures surface at join time like the original.
+            if v.contains(':') {
+                match v.parse::<std::net::Ipv6Addr>() {
+                    Ok(a6) => opts.multicast.push(McastGroup::V6(a6.octets())),
+                    Err(_) => {
+                        out::eprint_raw(&t.invalid_multicast(v));
+                        return Err(1);
+                    }
+                }
+            } else {
+                opts.multicast.push(McastGroup::V4(inet_addr(v)));
+            }
+        } else if a == "--ipv6" {
+            opts.ipv6 = true;
         } else if a.starts_with('-') {
             out::eprint_raw(&t.unknown_arg(a));
             return Err(1);

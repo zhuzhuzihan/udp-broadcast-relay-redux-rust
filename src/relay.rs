@@ -55,19 +55,23 @@ pub fn run(
     opts: &Options,
     ifaces: &mut Vec<Iface>,
     rcv: &sys::Fd,
+    rcv6: Option<&sys::Fd>,
     gram: &mut [u8; GRAM_SIZE],
     out_stream: &mut Out,
     t: &I18n,
     signals: &Signals,
     stats: &Stats,
     joined: &mut HashSet<(u32, u32)>,
+    joined6: &mut HashSet<([u8; 16], u32)>,
     netlink: Option<&sys::Fd>,
 ) {
     let ttl = opts.id + crate::packet::TTL_ID_OFFSET;
     let mut ctrl = [0u8; CTRL_SIZE];
     let mut name: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut name6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
 
-    // poll set: [0] = receiver, [1] = signal self-pipe, [2] = netlink (opt).
+    // poll set: [0] = v4 receiver, [1] = signal self-pipe,
+    //           [2] = v6 receiver (opt), [3] = netlink (opt).
     let mut pollfds = vec![
         libc::pollfd {
             fd: rcv.0,
@@ -80,6 +84,13 @@ pub fn run(
             revents: 0,
         },
     ];
+    if let Some(v6) = rcv6 {
+        pollfds.push(libc::pollfd {
+            fd: v6.0,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
     if let Some(nl) = netlink {
         pollfds.push(libc::pollfd {
             fd: nl.0,
@@ -87,9 +98,8 @@ pub fn run(
             revents: 0,
         });
     }
-    const IDX_RCV: usize = 0;
-    const IDX_SIG: usize = 1;
-    const IDX_NL: usize = 2;
+    let idx_v6 = rcv6.map(|_| 2usize);
+    let idx_nl = netlink.map(|_| pollfds.len() - 1);
 
     loop {
         match sys::poll(&mut pollfds, -1) {
@@ -97,7 +107,7 @@ pub fn run(
             Err(_) => continue, // EINTR etc.: retry, like the original's `len <= 0`
         }
 
-        if pollfds[IDX_SIG].revents & libc::POLLIN != 0 {
+        if pollfds[1].revents & libc::POLLIN != 0 {
             let mut shutdown = false;
             for tag in signals.drain() {
                 match tag {
@@ -114,7 +124,10 @@ pub fn run(
             }
         }
 
-        if let (true, Some(nl)) = (pollfds[IDX_NL].revents & libc::POLLIN != 0, netlink) {
+        if let (true, Some(nl)) = (
+            idx_nl.is_some_and(|i| pollfds[i].revents & libc::POLLIN != 0),
+            netlink,
+        ) {
             // SAFETY: netlink fd is live and poll declared it readable.
             let mut buf = [0u8; 8192];
             let n = unsafe { libc::recv(nl.0, buf.as_mut_ptr().cast(), buf.len(), 0) };
@@ -132,12 +145,14 @@ pub fn run(
                     .collect();
                 for ev in event::parse(&buf[..n as usize]) {
                     let actions = event::decide(&opts.interfaces, &managed, &ev);
-                    apply_actions(&actions, ifaces, opts, rcv.0, joined, t, out_stream);
+                    apply_actions(
+                        &actions, ifaces, opts, rcv.0, rcv6, joined, joined6, t, out_stream,
+                    );
                 }
             }
         }
 
-        if pollfds[IDX_RCV].revents & libc::POLLIN != 0 {
+        if pollfds[0].revents & libc::POLLIN != 0 {
             // Receive a broadcast packet (payload goes straight into the gram,
             // like the original's iovec pointing at gram + HEADER_LEN).
             let payload = &mut gram[HEADER_LEN..HEADER_LEN + crate::packet::MAX_PAYLOAD];
@@ -166,16 +181,194 @@ pub fn run(
                 stats,
             );
         }
+
+        // IPv6 multicast relay (opt-in via --ipv6).
+        if let (true, Some(v6fd)) = (
+            idx_v6.is_some_and(|i| pollfds[i].revents & libc::POLLIN != 0),
+            rcv6,
+        ) {
+            let payload = &mut gram[crate::packet::V6HEADER_LEN
+                ..crate::packet::V6HEADER_LEN + crate::packet::MAX_PAYLOAD];
+            let (len, ctrl_len) = match sys::recvmsg_into6(v6fd.0, payload, &mut ctrl, &mut name6) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if len <= 0 {
+                continue;
+            }
+            let len = len as usize;
+            stats
+                .received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            relay_one6(
+                opts,
+                ifaces,
+                gram,
+                out_stream,
+                t,
+                ttl,
+                &ctrl[..ctrl_len],
+                &mut name6,
+                len,
+                stats,
+            );
+        }
+    }
+}
+
+/// Process one IPv6 multicast datagram: identify the receiving interface via
+/// IPV6_PKTINFO, suppress echoes by hop limit, and re-send the datagram
+/// (forged v6 header, UDP checksum computed locally) out of every other
+/// managed interface that has a raw6 socket.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit state handoff, mirrors relay_one"
+)]
+fn relay_one6(
+    opts: &Options,
+    ifaces: &[Iface],
+    gram: &mut [u8; GRAM_SIZE],
+    out_stream: &mut Out,
+    t: &I18n,
+    ttl: u8,
+    ctrl: &[u8],
+    name: &mut libc::sockaddr_in6,
+    len: usize,
+    stats: &Stats,
+) {
+    // IPV6_HOPLIMIT (21) and IPV6_PKTINFO (50), level IPPROTO_IPV6.
+    let mut hop: i32 = 0;
+    let mut rcv_ifindex: i32 = 0;
+    let mut group: [u8; 16] = [0u8; 16];
+    let mut found_if = false;
+    for (level, ctype, data) in cmsg_iter(ctrl) {
+        if level == libc::IPPROTO_IPV6 && ctype == libc::IPV6_HOPLIMIT && data.len() >= 4 {
+            hop = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+        }
+        if level == libc::IPPROTO_IPV6
+            && ctype == libc::IPV6_PKTINFO
+            && data.len() >= std::mem::size_of::<libc::in6_pktinfo>()
+        {
+            // struct in6_pktinfo { in6_addr ipi6_addr; u32 ipi6_ifindex; }
+            group.copy_from_slice(&data[0..16]);
+            rcv_ifindex = u32::from_ne_bytes([data[16], data[17], data[18], data[19]]) as i32;
+            found_if = true;
+        }
+    }
+    if !found_if {
+        out::perror(t.perr_iface_missing(), out::errno());
+        return;
+    }
+    if hop == 0 {
+        out::perror(t.perr_ttl_missing(), out::errno());
+        return;
+    }
+
+    let mut from_idx: Option<usize> = None;
+    for (idx, iface) in ifaces.iter().enumerate() {
+        if iface.ifindex == rcv_ifindex {
+            from_idx = Some(idx);
+        }
+    }
+
+    let src_addr = name.sin6_addr.s6_addr;
+    let src_port = u16::from_be(name.sin6_port);
+
+    if opts.debug {
+        out_stream.print(&t.debug_recv6(
+            &std::net::Ipv6Addr::from(src_addr).to_string(),
+            u32::from(src_port),
+            &std::net::Ipv6Addr::from(group).to_string(),
+            u32::from(opts.port),
+            rcv_ifindex,
+            len,
+            hop,
+        ));
+    }
+
+    if hop == i32::from(ttl) {
+        if opts.debug {
+            out_stream.print(&t.debug_echo());
+        }
+        stats
+            .dropped_echo
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let Some(from_idx) = from_idx else {
+        if opts.debug {
+            out_stream.print(&t.debug_not_managed());
+        }
+        stats
+            .dropped_not_managed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+
+    for (idx, iface) in ifaces.iter().enumerate() {
+        if idx == from_idx {
+            continue;
+        }
+        let Some(raw6) = iface.raw6_socket.as_ref() else {
+            continue;
+        };
+        if opts.debug {
+            out_stream.print(&t.debug_send6(
+                &std::net::Ipv6Addr::from(src_addr).to_string(),
+                u32::from(src_port),
+                &std::net::Ipv6Addr::from(group).to_string(),
+                u32::from(opts.port),
+                iface.ifindex,
+            ));
+        }
+        let seg = crate::packet::udp_segment6(
+            src_addr,
+            group,
+            src_port,
+            opts.port,
+            &gram[crate::packet::V6HEADER_LEN..crate::packet::V6HEADER_LEN + len],
+        );
+        match sys::sendmsg6(
+            raw6.0,
+            &seg,
+            group,
+            opts.port,
+            ttl,
+            src_addr,
+            iface.ifindex as u32,
+        ) {
+            Ok(_) => {
+                stats
+                    .forwarded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                iface
+                    .sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(_) => {
+                out::perror("sendto", out::errno());
+                stats
+                    .send_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    if opts.debug {
+        out_stream.print("\n");
     }
 }
 
 /// Execute hot-plug actions: probe + create + join for Add, close for Remove.
+#[expect(clippy::too_many_arguments, reason = "executor needs both stacks")]
 fn apply_actions(
     actions: &[Action],
     ifaces: &mut Vec<Iface>,
     opts: &Options,
     rcv_fd: i32,
+    rcv6_fd: Option<&sys::Fd>,
     joined: &mut HashSet<(u32, u32)>,
+    joined6: &mut HashSet<([u8; 16], u32)>,
     t: &I18n,
     out_stream: &mut Out,
 ) {
@@ -187,18 +380,31 @@ fn apply_actions(
                 }
                 let ttl = opts.id + crate::packet::TTL_ID_OFFSET;
                 let added = sys::udp_socket().ok().and_then(|tmp| {
-                    iface::setup(tmp.0, name, ttl, opts.debug, out_stream, t)
+                    iface::setup(tmp.0, name, ttl, opts.debug, opts.ipv6, out_stream, t)
                         .ok()
                         .flatten()
                 });
                 if let Some(iface) = added {
                     for m in &opts.multicast {
-                        let multi = cli::inet_addr(m);
-                        if !joined.insert((multi, iface.ifaddr)) {
-                            continue;
-                        }
-                        if join_group(rcv_fd, multi, iface.ifaddr).is_err() {
-                            out::perror("IP_ADD_MEMBERSHIP on rcv", out::errno());
+                        match m {
+                            cli::McastGroup::V4(multi) => {
+                                if !joined.insert((*multi, iface.ifaddr)) {
+                                    continue;
+                                }
+                                if join_group(rcv_fd, *multi, iface.ifaddr).is_err() {
+                                    out::perror("IP_ADD_MEMBERSHIP on rcv", out::errno());
+                                }
+                            }
+                            cli::McastGroup::V6(group) => {
+                                if let Some(v6fd) = rcv6_fd {
+                                    if !joined6.insert((*group, iface.ifindex as u32)) {
+                                        continue;
+                                    }
+                                    if sys::join6(v6fd.0, *group, iface.ifindex as u32).is_err() {
+                                        out::perror("IPV6_JOIN_GROUP on rcv", out::errno());
+                                    }
+                                }
+                            }
                         }
                     }
                     out::eprint_raw(&t.iface_added(name));
@@ -216,7 +422,7 @@ fn apply_actions(
 }
 
 /// IP_ADD_MEMBERSHIP on the receive socket (shared by startup and hot-plug).
-fn join_group(fd: i32, multi: u32, ifaddr: u32) -> Result<(), ()> {
+pub fn join_group(fd: i32, multi: u32, ifaddr: u32) -> Result<(), ()> {
     let mreq = libc::ip_mreq {
         imr_multiaddr: libc::in_addr {
             s_addr: multi.swap_bytes(),

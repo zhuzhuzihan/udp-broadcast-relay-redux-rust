@@ -39,6 +39,8 @@ pub struct Iface {
     pub ifaddr: u32,
     pub ifindex: i32,
     pub raw_socket: sys::Fd,
+    /// Raw IPv6 send socket (`--ipv6` only).
+    pub raw6_socket: Option<sys::Fd>,
     /// Packets successfully forged out of this interface (SIGUSR1 dump).
     pub sent: std::sync::atomic::AtomicU64,
 }
@@ -188,6 +190,7 @@ pub fn setup(
     name: &str,
     #[cfg_attr(target_os = "linux", allow(unused_variables))] ttl: u8,
     debug: bool,
+    ipv6: bool,
     out_stream: &mut Out,
     t: &I18n,
 ) -> Result<Option<Iface>, SetupErr> {
@@ -272,12 +275,50 @@ pub fn setup(
             out::perror("setsockopt IP_MULTICAST_TTL", out::errno());
         }
     }
+    // Raw IPv6 send socket for --ipv6 relay. Linux builds the IPv6 header
+    // itself; IP_TRANSPARENT lets the forged (foreign) source address pass
+    // non-local validation — same effect the v4 raw+HDRINCL path has.
+    let raw6 = if ipv6 {
+        match sys::raw6_socket() {
+            Ok(fd) => {
+                #[cfg(target_os = "linux")]
+                {
+                    if sys::setsockopt_bind_to_device(fd.0, name).is_err() {
+                        out::perror("setsockopt SO_BINDTODEVICE", out::errno());
+                    }
+                    // SAFETY: int-valued transparent-socket option; needs CAP_NET_RAW.
+                    let one: i32 = 1;
+                    let rc = unsafe {
+                        libc::setsockopt(
+                            fd.0,
+                            libc::SOL_IP,
+                            libc::IP_TRANSPARENT,
+                            std::ptr::addr_of!(one).cast::<libc::c_void>(),
+                            std::mem::size_of::<i32>() as u32,
+                        )
+                    };
+                    if rc < 0 {
+                        out::perror("setsockopt IP_TRANSPARENT", out::errno());
+                    }
+                }
+                let _ = &fd;
+                Some(fd)
+            }
+            Err(_) => {
+                out::perror("socket", out::errno());
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(Some(Iface {
         name: name.to_string(),
         dstaddr,
         ifaddr,
         ifindex: c.ifindex,
         raw_socket: raw,
+        raw6_socket: raw6,
         sent: std::sync::atomic::AtomicU64::new(0),
     }))
 }

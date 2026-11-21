@@ -168,10 +168,10 @@ impl I18n {
         let base = self.usage(program);
         match self.lang {
             Lang::En => format!(
-                "{base}\nNew options:\n    -h, --help            show this help and exit\n    --version             show version and exit\n    --lang en|zh          user-facing message language (default: locale)\n    --list-interfaces     enumerate interfaces and exit (no root needed)\n    --log TARGET          error/log channel: stderr, syslog, file=PATH (default: stderr)\n\n"
+                "{base}\nNew options:\n    -h, --help            show this help and exit\n    --version             show version and exit\n    --lang en|zh          user-facing message language (default: locale)\n    --list-interfaces     enumerate interfaces and exit (no root needed)\n    --log TARGET          error/log channel: stderr, syslog, file=PATH (default: stderr)\n    --ipv6                also relay IPv6 multicast (new, dual-stack)\n\n"
             ),
             Lang::Zh => format!(
-                "{base}\n新增选项:\n    -h, --help            显示本帮助并退出\n    --version             显示版本号并退出\n    --lang en|zh          用户可见消息的语言（默认：跟随 locale）\n    --list-interfaces     枚举接口后退出（无需 root）\n    --log TARGET          错误/日志通道：stderr、syslog、file=PATH（默认 stderr）\n\n"
+                "{base}\n新增选项:\n    -h, --help            显示本帮助并退出\n    --version             显示版本号并退出\n    --lang en|zh          用户可见消息的语言（默认：跟随 locale）\n    --list-interfaces     枚举接口后退出（无需 root）\n    --log TARGET          错误/日志通道：stderr、syslog、file=PATH（默认 stderr）\n    --ipv6                同时中继 IPv6 组播（新增，双栈）\n\n"
             ),
         }
     }
@@ -301,6 +301,13 @@ impl I18n {
         match self.lang {
             Lang::En => format!("invalid id: {v} (expected 1-99)\n"),
             Lang::Zh => format!("无效的 id：{v}（应为 1-99）\n"),
+        }
+    }
+
+    pub fn invalid_multicast(&self, v: &str) -> String {
+        match self.lang {
+            Lang::En => format!("invalid multicast group: {v}\n"),
+            Lang::Zh => format!("无效的组播组：{v}\n"),
         }
     }
 
@@ -443,6 +450,24 @@ impl I18n {
     }
 
     pub fn debug_send(&self, fa: &str, fp: u32, ta: &str, tp: u32, iface: i32) -> String {
+        format!("-> [ {fa}:{fp} -> {ta}:{tp} (iface={iface})\n")
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "mirrors the v4 log line shape")]
+    pub fn debug_recv6(
+        &self,
+        fa: &str,
+        fp: u32,
+        ta: &str,
+        tp: u32,
+        iface: i32,
+        len: usize,
+        hlim: i32,
+    ) -> String {
+        format!("<- [ {fa}:{fp} -> {ta}:{tp} (iface={iface} len={len} hlim={hlim})\n")
+    }
+
+    pub fn debug_send6(&self, fa: &str, fp: u32, ta: &str, tp: u32, iface: i32) -> String {
         format!("-> [ {fa}:{fp} -> {ta}:{tp} (iface={iface})\n")
     }
 

@@ -58,3 +58,99 @@ pub fn forge(
         gram[2..4].copy_from_slice(&total.to_be_bytes());
     }
 }
+
+/// IPv6 payload limit: the gram holds the 40-byte IPv6 header.
+pub const V6HEADER_LEN: usize = 40;
+
+/// 16-bit ones' complement checksum with the IPv6 pseudo-header (mandatory
+/// for raw IPv6 — the kernel does not fill UDP checksums for us).
+pub fn udp_checksum(src: &[u8; 16], dst: &[u8; 16], udp: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for pair in src.chunks_exact(2) {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    }
+    for pair in dst.chunks_exact(2) {
+        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    }
+    let len = udp.len() as u32;
+    sum += len >> 16;
+    sum += len & 0xFFFF;
+    sum += 17; // next header = UDP
+    let mut i = 0usize;
+    while i + 1 < udp.len() {
+        sum += u16::from_be_bytes([udp[i], udp[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < udp.len() {
+        sum += u16::from_be_bytes([udp[i], 0]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build the UDP segment (header with checksum + payload) for a raw IPv6
+/// send. Linux IPv6 raw sockets do NOT accept a full IPv6 header — the kernel
+/// constructs it from the destination sockaddr plus IPV6_PKTINFO/IPV6_HOPLIMIT
+/// ancillary data (see sys::sendmsg6), so only this segment goes on the wire.
+pub fn udp_segment6(
+    src: [u8; 16],
+    dst: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut seg = Vec::with_capacity(UDPHEADER_LEN + payload.len());
+    seg.extend_from_slice(&src_port.to_be_bytes());
+    seg.extend_from_slice(&dst_port.to_be_bytes());
+    seg.extend_from_slice(&((UDPHEADER_LEN as u16) + payload.len() as u16).to_be_bytes());
+    seg.extend_from_slice(&[0, 0]); // checksum placeholder
+    seg.extend_from_slice(payload);
+    let c = udp_checksum(&src, &dst, &seg);
+    seg[6..8].copy_from_slice(&c.to_be_bytes());
+    seg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_checksum_self_consistent() {
+        // The canonical property: a segment carrying its own checksum
+        // checksums to zero.
+        let src = [0x20u8; 16];
+        let dst = [0x01u8; 16];
+        let mut seg = vec![0u8; 8 + 6];
+        seg[0..2].copy_from_slice(&1234u16.to_be_bytes());
+        seg[2..4].copy_from_slice(&5678u16.to_be_bytes());
+        seg[4..6].copy_from_slice(&((8u16) + 6).to_be_bytes());
+        seg[8..].copy_from_slice(b"payloa");
+        let c = udp_checksum(&src, &dst, &seg);
+        seg[6..8].copy_from_slice(&c.to_be_bytes());
+        // recompute over the segment with checksum zeroed
+        seg[6..8].fill(0);
+        assert_eq!(udp_checksum(&src, &dst, &seg), c);
+    }
+
+    #[test]
+    fn udp_segment6_layout() {
+        let src = std::net::Ipv6Addr::LOCALHOST.octets();
+        let dst = std::net::Ipv6Addr::LOCALHOST.octets();
+        let seg = udp_segment6(src, dst, 1000, 2000, b"hello");
+        assert_eq!(seg.len(), 8 + 5);
+        assert_eq!(u16::from_be_bytes([seg[0], seg[1]]), 1000);
+        assert_eq!(u16::from_be_bytes([seg[2], seg[3]]), 2000);
+        assert_eq!(u16::from_be_bytes([seg[4], seg[5]]), 13);
+        assert_ne!(&seg[6..8], &[0, 0]); // checksum present
+        assert_eq!(&seg[8..], b"hello");
+        // checksum property: zeroing the field and recomputing reproduces it
+        let mut seg2 = seg.clone();
+        seg2[6..8].fill(0);
+        assert_eq!(
+            udp_checksum(&src, &dst, &seg2),
+            u16::from_be_bytes([seg[6], seg[7]])
+        );
+    }
+}

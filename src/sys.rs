@@ -304,6 +304,206 @@ pub fn netlink_route(groups: u32) -> Result<Fd, std::io::Error> {
     Ok(Fd(fd))
 }
 
+/// socket(AF_INET6, SOCK_DGRAM, 0)
+pub fn udp6_socket() -> Result<Fd, std::io::Error> {
+    // SAFETY: plain socket(2) call with constant arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        Err(last_error())
+    } else {
+        Ok(Fd(fd))
+    }
+}
+
+/// socket(AF_INET6, SOCK_RAW, IPPROTO_RAW) — full-header IPv6 send socket.
+pub fn raw6_socket() -> Result<Fd, std::io::Error> {
+    // SAFETY: plain socket(2) call with constant arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    if fd < 0 {
+        Err(last_error())
+    } else {
+        Ok(Fd(fd))
+    }
+}
+
+/// IPV6_RECVPKTINFO / IPV6_RECVHOPLIMIT (IPPROTO_IPV6 level).
+pub fn setsockopt6_int(fd: i32, opt: i32, value: i32) -> Result<(), std::io::Error> {
+    // SAFETY: int-valued IPv6 socket option.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            opt,
+            std::ptr::addr_of!(value).cast::<libc::c_void>(),
+            size_of::<i32>() as u32,
+        )
+    };
+    if rc < 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// IPV6_JOIN_GROUP on the receive socket.
+pub fn join6(fd: i32, group: [u8; 16], ifindex: u32) -> Result<(), ()> {
+    let mreq = libc::ipv6_mreq {
+        ipv6mr_multiaddr: libc::in6_addr { s6_addr: group },
+        ipv6mr_interface: ifindex,
+    };
+    // Linux names it IPV6_ADD_MEMBERSHIP (20); BSD/macOS IPV6_JOIN_GROUP (12).
+    // Some embedded kernels only implement the BSD number — fall back on
+    // ENOPROTOOPT (observed on an Android kernel).
+    #[cfg(target_os = "linux")]
+    let opt = libc::IPV6_ADD_MEMBERSHIP;
+    #[cfg(not(target_os = "linux"))]
+    let opt = libc::IPV6_JOIN_GROUP;
+    // SAFETY: mreq is fully initialized; the kernel reads it inline.
+    let mut rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            opt,
+            &mreq as *const libc::ipv6_mreq as *const libc::c_void,
+            size_of::<libc::ipv6_mreq>() as u32,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    if rc < 0 && last_error().raw_os_error() == Some(libc::ENOPROTOOPT) {
+        // BSD number (12) — not exported by the linux-gnu libc crate.
+        const IPV6_JOIN_GROUP: i32 = 12;
+        rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                IPV6_JOIN_GROUP,
+                &mreq as *const libc::ipv6_mreq as *const libc::c_void,
+                size_of::<libc::ipv6_mreq>() as u32,
+            )
+        };
+    }
+    if rc < 0 {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+/// sendmsg on a raw IPv6 socket: the kernel builds the IPv6 header (Linux has
+/// no full-header mode for AF_INET6 raw); source address, outgoing interface
+/// and hop limit come from IPV6_PKTINFO / IPV6_HOPLIMIT ancillary data.
+pub fn sendmsg6(
+    fd: i32,
+    seg: &[u8],
+    dst: [u8; 16],
+    port: u16,
+    hop_limit: u8,
+    src: [u8; 16],
+    ifindex: u32,
+) -> Result<usize, std::io::Error> {
+    // SAFETY: every pointed-to buffer is initialized and outlives sendmsg.
+    let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    sa.sin6_port = port.to_be();
+    sa.sin6_addr = libc::in6_addr { s6_addr: dst };
+    sa.sin6_scope_id = ifindex;
+
+    // ancillary data: IPV6_PKTINFO (in6_pktinfo) + IPV6_HOPLIMIT (int)
+    let mut cmsg = [0u8; 64];
+    let mut off = 0usize;
+    let mut put = |off: &mut usize, level: i32, ty: i32, data: &[u8]| {
+        let len = 16 + data.len(); // cmsghdr 16 + data; padded to sizeof(long)
+        let padded = (len + 7) & !7;
+        // cmsghdr: len (size_t), level (int), type (int)
+        let hdr = (len as u64).to_ne_bytes();
+        cmsg[*off..*off + 8].copy_from_slice(&hdr);
+        cmsg[*off + 8..*off + 12].copy_from_slice(&level.to_ne_bytes());
+        cmsg[*off + 12..*off + 16].copy_from_slice(&ty.to_ne_bytes());
+        cmsg[*off + 16..*off + 16 + data.len()].copy_from_slice(data);
+        *off += padded;
+    };
+    let pktinfo = libc::in6_pktinfo {
+        ipi6_addr: libc::in6_addr { s6_addr: src },
+        ipi6_ifindex: ifindex,
+    };
+    // SAFETY: plain POD struct copy.
+    let pkt_bytes: [u8; 20] = unsafe { std::mem::transmute(pktinfo) };
+    put(&mut off, libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &pkt_bytes);
+    put(
+        &mut off,
+        libc::IPPROTO_IPV6,
+        libc::IPV6_HOPLIMIT,
+        &[hop_limit, 0, 0, 0],
+    );
+
+    let mut iov = libc::iovec {
+        iov_base: seg.as_ptr() as *mut libc::c_void,
+        iov_len: seg.len(),
+    };
+    let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
+    mh.msg_name = &sa as *const libc::sockaddr_in6 as *mut libc::c_void;
+    mh.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    mh.msg_iov = &mut iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cmsg.as_mut_ptr().cast();
+    mh.msg_controllen = off as _;
+    let rc = unsafe { libc::sendmsg(fd, &mh, 0) };
+    if rc < 0 {
+        Err(last_error())
+    } else {
+        Ok(rc as usize)
+    }
+}
+
+/// Bind an IPv6 socket to [::]:port.
+pub fn bind6(fd: i32, port: u16) -> Result<(), std::io::Error> {
+    // SAFETY: sockaddr_in6 fully initialized; bind(2) with the right size.
+    let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    sa.sin6_port = port.to_be();
+    sa.sin6_addr = libc::in6_addr { s6_addr: [0u8; 16] };
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+            size_of::<libc::sockaddr_in6>() as u32,
+        )
+    };
+    if rc < 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// recvmsg with an IPv6 name buffer.
+pub fn recvmsg_into6(
+    fd: i32,
+    payload: &mut [u8],
+    ctrl: &mut [u8],
+    name: &mut libc::sockaddr_in6,
+) -> Result<(isize, usize), std::io::Error> {
+    let mut iov = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    // SAFETY: msghdr zeroed then all fields the kernel reads initialized.
+    let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
+    mh.msg_name = name as *mut libc::sockaddr_in6 as *mut libc::c_void;
+    mh.msg_namelen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    mh.msg_iov = &mut iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = ctrl.as_mut_ptr().cast();
+    mh.msg_controllen = ctrl.len() as _;
+    // SAFETY: buffers valid and sized as set above.
+    let n = unsafe { libc::recvmsg(fd, &mut mh, 0) };
+    if n < 0 {
+        Err(last_error())
+    } else {
+        Ok((n, mh.msg_controllen as usize))
+    }
+}
+
 /// poll(2): wait for readiness on the given fds. Returns the ready count.
 pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> Result<usize, std::io::Error> {
     // SAFETY: fds is a valid, correctly-sized slice for the call.

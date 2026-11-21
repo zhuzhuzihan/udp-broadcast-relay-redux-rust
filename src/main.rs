@@ -152,7 +152,15 @@ fn main() {
     let mut seen_idx = HashSet::new();
     let mut fatal_missing: Vec<String> = Vec::new();
     for name in &dev_names {
-        match iface::setup(tmp_fd.0, name, ttl, opts.debug, &mut out_stream, &t) {
+        match iface::setup(
+            tmp_fd.0,
+            name,
+            ttl,
+            opts.debug,
+            opts.ipv6,
+            &mut out_stream,
+            &t,
+        ) {
             Ok(Some(iface)) => {
                 // Two different names can resolve to the same kernel index
                 // (aliases): keep only the first.
@@ -200,18 +208,33 @@ fn main() {
     sys::close(&mut tmp_fd);
 
     // Broadcast receiving socket (+ the joined-membership table).
-    let (rcv, mut joined) = match setup_receiver(&opts, &ifaces, &mut out_stream, &t) {
+    let receiver = match setup_receiver(&opts, &ifaces, &mut out_stream, &t) {
         Ok(v) => v,
         Err(()) => {
             out_stream.flush();
             std::process::exit(1);
         }
     };
+    let Receiver {
+        v4: rcv,
+        v6: rcv6,
+        mut joined,
+        mut joined6,
+    } = receiver;
 
     // Hot-plug monitoring (Linux): follow link/IPv4-address changes so the
     // managed set tracks reality instead of a one-shot startup snapshot.
     #[cfg(target_os = "linux")]
-    let netlink = sys::netlink_route((libc::RTMGRP_LINK | libc::RTMGRP_IPV4_IFADDR) as u32).ok();
+    let netlink = sys::netlink_route(
+        (libc::RTMGRP_LINK
+            | libc::RTMGRP_IPV4_IFADDR
+            | if opts.ipv6 {
+                libc::RTMGRP_IPV6_IFADDR
+            } else {
+                0
+            }) as u32,
+    )
+    .ok();
     #[cfg(not(target_os = "linux"))]
     let netlink: Option<sys::Fd> = None;
 
@@ -248,12 +271,14 @@ fn main() {
         &opts,
         &mut ifaces,
         &rcv,
+        rcv6.as_ref(),
         &mut gram,
         &mut out_stream,
         &t,
         &signals,
         &stats,
         &mut joined,
+        &mut joined6,
         netlink.as_ref(),
     );
 }
@@ -262,12 +287,20 @@ fn main() {
 /// reception (Linux) or TTL/IF/DSTADDR reception (BSD/macOS), multicast
 /// membership per (--multicast × managed interface), then bind to 0.0.0.0:port.
 /// All failures print perror and return Err(()) — caller exits 1.
+/// The receive socket(s) and the membership tables for hot-plug rejoin.
+pub struct Receiver {
+    pub v4: sys::Fd,
+    pub v6: Option<sys::Fd>,
+    pub joined: std::collections::HashSet<(u32, u32)>,
+    pub joined6: std::collections::HashSet<([u8; 16], u32)>,
+}
+
 fn setup_receiver(
     opts: &cli::Options,
     ifaces: &[iface::Iface],
     out_stream: &mut Out,
     t: &I18n,
-) -> Result<(sys::Fd, std::collections::HashSet<(u32, u32)>), ()> {
+) -> Result<Receiver, ()> {
     let rcv = match sys::udp_socket() {
         Ok(fd) => fd,
         Err(_) => return fatal_perror("socket"),
@@ -302,43 +335,37 @@ fn setup_receiver(
     }
 
     let mut joined = HashSet::new();
+    let mut joined6 = HashSet::new();
     for mcast in &opts.multicast {
-        for iface in ifaces {
-            let multi = cli::inet_addr(mcast); // unchecked in the original; invalid → join fails
-                                               // The original would join the same (group, interface) pair twice
-                                               // and die on EADDRINUSE — skip repeats instead.
-            if !joined.insert((multi, iface.ifaddr)) {
-                if opts.debug {
-                    let line = t.dup_membership(mcast, &i18n::ipv4_str(iface.ifaddr));
-                    out_stream.print(&line);
+        match mcast {
+            cli::McastGroup::V4(multi) => {
+                for iface in ifaces {
+                    // The original would join the same (group, interface) pair
+                    // twice and die on EADDRINUSE — skip repeats instead.
+                    if !joined.insert((*multi, iface.ifaddr)) {
+                        if opts.debug {
+                            let line =
+                                t.dup_membership(&mcast.to_string(), &i18n::ipv4_str(iface.ifaddr));
+                            out_stream.print(&line);
+                        }
+                        continue;
+                    }
+                    if opts.debug {
+                        // The original prints this before the setsockopt, per pair.
+                        let line = t.debug_add_membership(
+                            &i18n::ipv4_str(iface.ifaddr),
+                            &mcast.to_string(),
+                        );
+                        out_stream.print(&line);
+                    }
+                    if relay::join_group(fd, *multi, iface.ifaddr).is_err() {
+                        return fatal_perror("IP_ADD_MEMBERSHIP on rcv");
+                    }
                 }
-                continue;
             }
-            if opts.debug {
-                // The original prints this before the setsockopt, per pair.
-                let line = t.debug_add_membership(&i18n::ipv4_str(iface.ifaddr), mcast);
-                out_stream.print(&line);
-            }
-            let mreq = libc::ip_mreq {
-                imr_multiaddr: libc::in_addr {
-                    s_addr: multi.swap_bytes(),
-                },
-                imr_interface: libc::in_addr {
-                    s_addr: iface.ifaddr.swap_bytes(),
-                },
-            };
-            // SAFETY: mreq is fully initialized; IP_ADD_MEMBERSHIP reads it inline.
-            let rc = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_IP,
-                    libc::IP_ADD_MEMBERSHIP,
-                    &mreq as *const libc::ip_mreq as *const libc::c_void,
-                    std::mem::size_of::<libc::ip_mreq>() as u32,
-                )
-            };
-            if rc < 0 {
-                return fatal_perror("IP_ADD_MEMBERSHIP on rcv");
+            cli::McastGroup::V6(_) => {
+                // IPv6 groups join on the v6 receive socket, which is created
+                // below (see the --ipv6 section) — not on the v4 socket.
             }
         }
     }
@@ -357,7 +384,52 @@ fn setup_receiver(
         out::eprint_raw(&t.rcv_bind());
         return Err(());
     }
-    Ok((rcv, joined))
+
+    // IPv6 receiver (opt-in via --ipv6): RECVPKTINFO + RECVDSTADDR hoplimit.
+    let v6 = if opts.ipv6 {
+        let fd6 = match sys::udp6_socket() {
+            Ok(fd) => fd,
+            Err(_) => return fatal_perror("socket"),
+        };
+        // The v4 socket holds the wildcard :port; without reuseport the
+        // dual-stack bind of [::]:port would collide with it.
+        if sys::setsockopt_int(fd6.0, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1).is_err() {
+            return fatal_perror("SO_REUSEPORT on rcv");
+        }
+        if sys::setsockopt6_int(fd6.0, libc::IPV6_RECVPKTINFO, 1).is_err() {
+            return fatal_perror("IPV6_RECVPKTINFO on rcv");
+        }
+        if sys::setsockopt6_int(fd6.0, libc::IPV6_RECVHOPLIMIT, 1).is_err() {
+            return fatal_perror("IPV6_RECVHOPLIMIT on rcv");
+        }
+        for mcast in &opts.multicast {
+            if let cli::McastGroup::V6(group) = mcast {
+                for iface in ifaces {
+                    if !joined6.insert((*group, iface.ifindex as u32)) {
+                        continue;
+                    }
+                    if sys::join6(fd6.0, *group, iface.ifindex as u32).is_err() {
+                        return fatal_perror("IPV6_JOIN_GROUP on rcv");
+                    }
+                }
+            }
+        }
+        if sys::bind6(fd6.0, opts.port).is_err() {
+            out::perror("bind", out::errno());
+            out::eprint_raw(&t.rcv_bind());
+            return Err(());
+        }
+        Some(fd6)
+    } else {
+        None
+    };
+
+    Ok(Receiver {
+        v4: rcv,
+        v6,
+        joined,
+        joined6,
+    })
 }
 
 fn fatal_perror<T>(prefix: &str) -> Result<T, ()> {
