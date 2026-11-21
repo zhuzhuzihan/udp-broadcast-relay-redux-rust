@@ -120,9 +120,7 @@ pub fn forge6(
 }
 
 /// Build the UDP segment (header with checksum + payload) for a raw IPv6
-/// send. Linux IPv6 raw sockets do NOT accept a full IPv6 header — the kernel
-/// constructs it from the destination sockaddr plus IPV6_PKTINFO/IPV6_HOPLIMIT
-/// ancillary data (see sys::sendmsg6), so only this segment goes on the wire.
+/// send — the non-hdrincl fallback path (sys::sendmsg6) uses this form.
 pub fn udp_segment6(
     src: [u8; 16],
     dst: [u8; 16],

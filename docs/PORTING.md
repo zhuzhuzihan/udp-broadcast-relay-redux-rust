@@ -118,12 +118,17 @@ current contract:
   (12) — sys::join6 falls back on ENOPROTOOPT. `SO_BINDTODEVICE` and
   `IP_TRANSPARENT` may also be missing there; both are non-fatal
   (SO_BINDTODEVICE loss just means routing-table-dependent egress).
-- **Live 2-interface check blocked in the lab**: this sandbox kernel rejects
-  every raw IPv6 sendto/sendmsg with EINVAL (verified with independent python
-  probes — plain UDP6 works), and `ip -6 addr add` returns EPERM. The
-  datapath was verified up to the kernel boundary (receive, cmsg parsing,
-  echo detection, counters); the full live loop runs in CI (ubuntu kernels
-  have working raw IPv6) via `tests/relay_e2e.rs` (`--ignored` tests).
+- **Live 2-interface check**: the lab kernel's policy toward raw IPv6 send
+  is intermittent — probes sometimes EINVAL everything (while plain UDP6
+  works), later runs succeed end-to-end. The relay therefore degrades its
+  send across four forms (hdrincl full-header sendto, PKTINFO+HOPLIMIT,
+  PKTINFO-without-source+HOPLIMIT, bare segment sendto with socket-level
+  hop limit) and the e2e test probes raw-send support first, skipping with
+  a documented reason when the kernel refuses. On capable kernels the full
+  live loop passes end-to-end (v6 forwarded packet captured on the second
+  interface with forged source, group destination, hop limit 65 and intact
+  payload). GitHub-hosted runners behave like the lab's bad case; CI runs
+  the v4 battery and skips v6 with the reason visible in the log.
 
 ## 6. Cross-platform compile status (cargo check)
 

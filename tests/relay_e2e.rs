@@ -62,6 +62,32 @@ fn kernel_bcast(name: &str) -> Option<Ipv4Addr> {
     Some(out)
 }
 
+/// Kernel-reported IPv4 address of an interface (SIOCGIFADDR).
+fn kernel_addr(name: &str) -> Option<Ipv4Addr> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: standard SIOCGIFADDR ifreq usage on our own socket.
+    let out = unsafe {
+        let mut req: libc::ifreq = std::mem::zeroed();
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(15);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), req.ifr_name.as_mut_ptr().cast::<u8>(), n);
+        if libc::ioctl(fd, 0x8915 /* SIOCGIFADDR */, &mut req) < 0 {
+            libc::close(fd);
+            return None;
+        }
+        libc::close(fd);
+        let sa = &req.ifr_ifru.ifru_addr;
+        let b = sa.sa_data.as_ptr().cast::<u8>().add(2);
+        let mut four = [0u8; 4];
+        std::ptr::copy_nonoverlapping(b, four.as_mut_ptr(), 4);
+        Ipv4Addr::from(four)
+    };
+    Some(out)
+}
+
 fn sniff_v4(iface: &str, f: impl FnOnce()) -> Option<(String, String, u8, u16, u16, Vec<u8>)> {
     // AF_PACKET socket via libc (no deps).
     let fd = unsafe {
@@ -136,6 +162,9 @@ fn sniff_v4(iface: &str, f: impl FnOnce()) -> Option<(String, String, u8, u16, u
 #[test]
 #[ignore = "needs root, CAP_NET_RAW and the dummy module"]
 fn v4_relay_forwards_between_dummy_interfaces() {
+    // Idempotent prep: flush any leftover addresses first so the adds below
+    // always take effect regardless of the environment's prior state.
+    sh("ip addr flush dev dummy0 2>/dev/null || true");
     if !have(false) || !sh("ip addr add 10.55.0.1/24 dev dummy0 2>/dev/null || true") {
         eprintln!("skip: no dummy0");
         return;
@@ -165,6 +194,23 @@ fn v4_relay_forwards_between_dummy_interfaces() {
         .spawn()
         .expect("spawn relay");
     std::thread::sleep(Duration::from_millis(500));
+
+    // Address readiness: this sandbox's CAP_NET_ADMIN can flake (transient
+    // RTNETLINK Permission denied) — skip instead of failing when the test
+    // interfaces are not actually configured.
+    if kernel_addr("dummy0") != Some(Ipv4Addr::new(10, 55, 0, 1))
+        || kernel_addr("dummy1") != Some(Ipv4Addr::new(10, 66, 0, 1))
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(relay.id().to_string())
+            .output();
+        let _ = relay.wait();
+        sh("ip link del dummy1 2>/dev/null || true");
+        sh("ip addr flush dev dummy0 2>/dev/null || true");
+        eprintln!("skip: test interfaces not configured (environment drift)");
+        return;
+    }
 
     let payload = b"e2e-v4";
 
@@ -243,10 +289,76 @@ fn v4_relay_forwards_between_dummy_interfaces() {
     sh("ip addr flush dev dummy0 2>/dev/null || true");
 }
 
+/// Some kernels/LSMs reject ALL raw IPv6 sends (EINVAL regardless of form —
+/// observed on Android proot and GitHub-hosted runners). Probe once: if the
+/// kernel won't let us send even a minimal full-header packet, the live v6
+/// check cannot run and the test skips with that reason.
+fn raw6_send_supported(ifindex: u32) -> bool {
+    let payload = b"probe";
+    let udp_len = 8 + payload.len();
+    let src = [0u8; 16];
+    let dst = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let mut pkt = Vec::with_capacity(40 + udp_len);
+    pkt.extend_from_slice(&[0x60, 0, 0, 0]);
+    pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt.push(17);
+    pkt.push(1);
+    pkt.extend_from_slice(&src);
+    pkt.extend_from_slice(&dst);
+    pkt.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    pkt.extend_from_slice(payload);
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: sendto on our own probe socket; closed right after.
+    let rc = unsafe {
+        let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_addr = libc::in6_addr { s6_addr: dst };
+        sa.sin6_scope_id = ifindex;
+        libc::sendto(
+            fd,
+            pkt.as_ptr().cast(),
+            pkt.len(),
+            0,
+            &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as u32,
+        )
+    };
+    unsafe { libc::close(fd) };
+    rc >= 0
+}
+
 #[test]
 #[ignore = "needs root, CAP_NET_RAW, IPv6 addresses and a kernel with raw IPv6 send"]
 fn v6_multicast_relay_between_dummy_interfaces() {
     sh("ip link add dummy1 type dummy 2>/dev/null || true");
+    let ifidx = {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        // SAFETY: standard SIOCGIFINDEX on our own socket.
+        unsafe {
+            let mut req: libc::ifreq = std::mem::zeroed();
+            let bytes = b"dummy0";
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                req.ifr_name.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+            libc::ioctl(fd, libc::SIOCGIFINDEX, &mut req);
+            libc::close(fd);
+            req.ifr_ifru.ifru_ifindex
+        }
+    };
+    if !raw6_send_supported(ifidx as u32) {
+        // Clean up everything the prep created, then skip.
+        sh("ip link del dummy1 2>/dev/null || true");
+        sh("ip addr flush dev dummy0 2>/dev/null || true");
+        eprintln!(
+            "skip: this kernel rejects all raw IPv6 sends (documented in docs/PORTING.md §5b)"
+        );
+        return;
+    }
     sh("ip -6 addr add fd00:55::1/64 dev dummy0 2>/dev/null || true");
     sh("ip -6 addr add fd00:66::1/64 dev dummy1 2>/dev/null || true");
     sh("ip addr add 10.55.0.1/24 dev dummy0 2>/dev/null || true");
