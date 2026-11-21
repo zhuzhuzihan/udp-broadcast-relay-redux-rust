@@ -276,7 +276,7 @@ fn v6_multicast_relay_between_dummy_interfaces() {
             "--multicast",
             "ff0e::e2e",
         ])
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn relay");
@@ -327,14 +327,25 @@ fn v6_multicast_relay_between_dummy_interfaces() {
         .arg("-TERM")
         .arg(relay.id().to_string())
         .output();
+    // Capture the relay's debug output BEFORE any cleanup — it is the
+    // diagnostic trail when no packet is captured.
+    let mut dbg = String::new();
+    if let Some(mut out) = relay.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut dbg);
+    }
     let _ = relay.wait();
 
     sh("ip link del dummy1 2>/dev/null || true");
     sh("ip addr flush dev dummy0 2>/dev/null || true");
-    let (src, dst, hlim, _sp, dp, pl) = cap.expect(
-        "no forwarded v6 packet captured — if this kernel rejects raw IPv6 \
-         sends (EINVAL on any sendto), the live v6 check cannot run here",
-    );
+    let (src, dst, hlim, _sp, dp, pl) = match cap {
+        Some(v) => v,
+        None => panic!(
+            "no forwarded v6 packet captured — if this kernel rejects raw IPv6 \
+             sends (EINVAL on any sendto), the live v6 check cannot run here; \
+             relay debug:\n{dbg}"
+        ),
+    };
     assert_eq!(pl, payload);
     assert_eq!(dst, "ff0e::e2e");
     assert_eq!(hlim, 65);
