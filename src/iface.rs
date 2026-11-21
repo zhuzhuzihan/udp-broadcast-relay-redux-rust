@@ -21,16 +21,17 @@ pub fn setup(
     tmp_fd: i32,
     name: &str,
     ttl: u8,
+    debug: bool,
     out_stream: &mut Out,
     t: &I18n,
 ) -> Result<Option<Iface>, ()> {
     #[cfg(target_os = "linux")]
     {
-        setup_linux(tmp_fd, name, ttl, out_stream, t)
+        setup_linux(tmp_fd, name, ttl, debug, out_stream, t)
     }
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
     {
-        setup_bsd(tmp_fd, name, ttl, out_stream, t)
+        setup_bsd(tmp_fd, name, ttl, debug, out_stream, t)
     }
 }
 
@@ -44,6 +45,7 @@ fn setup_linux(
     tmp_fd: i32,
     name: &str,
     ttl: u8,
+    debug: bool,
     out_stream: &mut Out,
     t: &I18n,
 ) -> Result<Option<Iface>, ()> {
@@ -96,6 +98,7 @@ fn setup_linux(
             ifaddr,
             dstaddr,
             ttl,
+            debug,
             out_stream,
             t,
         )
@@ -114,6 +117,7 @@ fn setup_linux(
             ifaddr,
             dstaddr,
             ttl,
+            debug,
             out_stream,
             t,
         )
@@ -135,6 +139,7 @@ fn finish(
     ifaddr: u32,
     dstaddr: u32,
     _ttl: u8,
+    debug: bool,
     out_stream: &mut Out,
     t: &I18n,
 ) -> Result<Iface, ()> {
@@ -147,7 +152,9 @@ fn finish(
     let end = printed_name.iter().position(|c| *c == 0).unwrap_or(16);
     let printed = String::from_utf8_lossy(&printed_name[..end]);
 
-    out_stream.print(&t.debug_iface(&printed, ifindex, &ipv4_str(ifaddr), &ipv4_str(dstaddr)));
+    if debug {
+        out_stream.print(&t.debug_iface(&printed, ifindex, &ipv4_str(ifaddr), &ipv4_str(dstaddr)));
+    }
 
     // One raw socket per interface for sending.
     let raw = match sys::raw_socket() {
@@ -181,6 +188,7 @@ fn setup_bsd(
     _tmp_fd: i32,
     name: &str,
     ttl: u8,
+    debug: bool,
     out_stream: &mut Out,
     t: &I18n,
 ) -> Result<Option<Iface>, ()> {
@@ -219,7 +227,7 @@ fn setup_bsd(
         }
         // SAFETY: ifr_broadaddr holds a sockaddr_in after SIOCGIFBRDADDR.
         let dstaddr = unsafe { sys::sockaddr_to_addr(&req.ifr_ifru.ifru_broadaddr) };
-        return finish_bsd(name, ifindex, ifaddr, dstaddr, ttl, out_stream, t).map(Some);
+        return finish_bsd(name, ifindex, ifaddr, dstaddr, ttl, debug, out_stream, t).map(Some);
     }
     if sys::ioctl_ifreq(_tmp_fd, sys::SIOCGIFDSTADDR, &mut req).is_err() {
         return fatal_perror("ioctl(SIOCGIFBRDADDR)");
@@ -240,10 +248,13 @@ fn finish_bsd(
     ifaddr: u32,
     dstaddr: u32,
     ttl: u8,
+    debug: bool,
     out_stream: &mut Out,
     t: &I18n,
 ) -> Result<Iface, ()> {
-    out_stream.print(&t.debug_iface(name, ifindex, &ipv4_str(ifaddr), &ipv4_str(dstaddr)));
+    if debug {
+        out_stream.print(&t.debug_iface(name, ifindex, &ipv4_str(ifaddr), &ipv4_str(dstaddr)));
+    }
 
     let mut raw = match sys::raw_socket() {
         Ok(fd) => fd,

@@ -226,6 +226,41 @@ impl I18n {
         }
     }
 
+    pub fn no_interfaces(&self) -> String {
+        match self.lang {
+            Lang::En => "no usable interfaces found\n".to_string(),
+            Lang::Zh => "未发现可用的网络接口\n".to_string(),
+        }
+    }
+
+    pub fn dup_dev(&self, v: &str) -> String {
+        match self.lang {
+            Lang::En => format!("duplicate --dev ignored: {v}\n"),
+            Lang::Zh => format!("忽略重复的 --dev：{v}\n"),
+        }
+    }
+
+    pub fn dup_iface(&self, v: &str, idx: i32) -> String {
+        match self.lang {
+            Lang::En => format!("duplicate interface index ignored: {v} (ifindex {idx})\n"),
+            Lang::Zh => format!("忽略重复的接口序号：{v}（ifindex {idx}）\n"),
+        }
+    }
+
+    pub fn dup_membership(&self, group: &str, ifaddr: &str) -> String {
+        match self.lang {
+            Lang::En => format!("duplicate multicast membership ignored: {group} on {ifaddr}\n"),
+            Lang::Zh => format!("忽略重复的组播成员：{group} @ {ifaddr}\n"),
+        }
+    }
+
+    pub fn shutdown(&self) -> String {
+        match self.lang {
+            Lang::En => "shutting down\n".to_string(),
+            Lang::Zh => "正在退出\n".to_string(),
+        }
+    }
+
     pub fn debug_forking(&self) -> String {
         match self.lang {
             Lang::En => "Forking Mode enabled\n".to_string(),

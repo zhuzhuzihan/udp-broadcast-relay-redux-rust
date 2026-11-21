@@ -16,10 +16,14 @@ mod iface;
 mod out;
 mod packet;
 mod relay;
+mod signal;
+mod stats;
 mod sys;
 
 use i18n::I18n;
 use out::Out;
+use stats::Stats;
+use std::collections::HashSet;
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -54,6 +58,18 @@ fn main() {
         ));
     }
 
+    // Deduplicate --dev names: the original would create a second raw socket
+    // for the same interface and forward duplicate copies back onto it.
+    let mut seen_dev = HashSet::new();
+    let mut dev_names = Vec::with_capacity(opts.interfaces.len());
+    for name in &opts.interfaces {
+        if seen_dev.insert(name.clone()) {
+            dev_names.push(name.clone());
+        } else {
+            out::eprint_raw(&t.dup_dev(name));
+        }
+    }
+
     // Temporary socket used to query interface addresses (closed right after).
     let mut tmp_fd = match sys::raw_socket() {
         Ok(fd) => fd,
@@ -67,9 +83,18 @@ fn main() {
 
     // Set up one raw sending socket per requested interface.
     let mut ifaces: Vec<iface::Iface> = Vec::new();
-    for name in &opts.interfaces {
-        match iface::setup(tmp_fd.0, name, ttl, &mut out_stream, &t) {
-            Ok(Some(iface)) => ifaces.push(iface),
+    let mut seen_idx = HashSet::new();
+    for name in &dev_names {
+        match iface::setup(tmp_fd.0, name, ttl, opts.debug, &mut out_stream, &t) {
+            Ok(Some(iface)) => {
+                // Two different names can resolve to the same kernel index
+                // (aliases): keep only the first.
+                if seen_idx.insert(iface.ifindex) {
+                    ifaces.push(iface);
+                } else {
+                    out::eprint_raw(&t.dup_iface(name, iface.ifindex));
+                }
+            }
             Ok(None) => {} // down or loopback: silently skipped
             Err(()) => {
                 // perror already written; exit like the original.
@@ -81,6 +106,14 @@ fn main() {
 
     if opts.debug {
         out_stream.print(&t.debug_found(ifaces.len()));
+    }
+
+    // Running with no managed interface would only bind the port and wait
+    // forever (the original's zombie-daemon mode) — fail fast instead.
+    if ifaces.is_empty() {
+        out::eprint_raw(&t.no_interfaces());
+        out_stream.flush();
+        std::process::exit(1);
     }
 
     sys::close(&mut tmp_fd);
@@ -111,8 +144,28 @@ fn main() {
         sys::close_fd(2);
     }
 
+    // Graceful shutdown / stats via the self-pipe (ADR-011). Installed after
+    // the fork so only the (grand-)child that runs the loop owns them.
+    let signals = match signal::Signals::install() {
+        Ok(s) => s,
+        Err(_) => {
+            out::perror("sigaction", out::errno());
+            std::process::exit(1);
+        }
+    };
+    let stats = Stats::default();
+
     let mut gram = packet::new_gram();
-    relay::run(&opts, &ifaces, &rcv, &mut gram, &mut out_stream, &t);
+    relay::run(
+        &opts,
+        &ifaces,
+        &rcv,
+        &mut gram,
+        &mut out_stream,
+        &t,
+        &signals,
+        &stats,
+    );
 }
 
 /// Create the receiving socket: SO_BROADCAST, SO_REUSEPORT, TTL/PKTINFO
@@ -158,9 +211,19 @@ fn setup_receiver(
         }
     }
 
+    let mut joined = HashSet::new();
     for mcast in &opts.multicast {
         for iface in ifaces {
             let multi = cli::inet_addr(mcast); // unchecked in the original; invalid → join fails
+                                               // The original would join the same (group, interface) pair twice
+                                               // and die on EADDRINUSE — skip repeats instead.
+            if !joined.insert((multi, iface.ifaddr)) {
+                if opts.debug {
+                    let line = t.dup_membership(mcast, &i18n::ipv4_str(iface.ifaddr));
+                    out_stream.print(&line);
+                }
+                continue;
+            }
             if opts.debug {
                 // The original prints this before the setsockopt, per pair.
                 let line = t.debug_add_membership(&i18n::ipv4_str(iface.ifaddr), mcast);

@@ -14,6 +14,11 @@ impl Fd {
             self.0 = -1;
         }
     }
+
+    /// SAFETY: takes ownership of a raw fd previously created elsewhere.
+    pub unsafe fn from_raw(fd: i32) -> Fd {
+        Fd(fd)
+    }
 }
 
 impl Drop for Fd {
@@ -302,4 +307,15 @@ pub fn close_fd(fd: i32) {
 
 pub fn close(fd: &mut Fd) {
     fd.close();
+}
+
+/// poll(2): wait for readiness on the given fds. Returns the ready count.
+pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> Result<usize, std::io::Error> {
+    // SAFETY: fds is a valid, correctly-sized slice for the call.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if rc < 0 {
+        Err(last_error())
+    } else {
+        Ok(rc as usize)
+    }
 }

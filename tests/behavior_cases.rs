@@ -117,10 +117,46 @@ fn recorded_behavior_cases_match_the_original() {
     let mut failures = Vec::new();
     for (name, toml) in &tomls {
         let (args, want_code) = parse_case(toml);
-        let out = Command::new(bin).args(&args).output().expect("spawn");
-        let got_code = out.status.code();
-        let got_out = normalize(&String::from_utf8_lossy(&out.stdout));
-        let got_err = normalize(&String::from_utf8_lossy(&out.stderr));
+        let mut child = Command::new(bin)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        // Guard against environment drift: a case that hangs means the
+        // sandbox no longer matches the recording setup (e.g. dummy0 must
+        // exist, be up, and have no IPv4 address).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let out = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut o = child.stdout.take().unwrap();
+                    let mut e = child.stderr.take().unwrap();
+                    use std::io::Read;
+                    let mut ob = Vec::new();
+                    let mut eb = Vec::new();
+                    let _ = o.read_to_end(&mut ob);
+                    let _ = e.read_to_end(&mut eb);
+                    break (status, ob, eb);
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!(
+                            "case {name} hung for 10s — recording environment drifted \
+                               (dummy0 must exist, be UP, and have no IPv4 address)"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("case {name}: {e}"),
+            }
+        };
+        let (status, out_bytes, err_bytes) = out;
+        let got_code = status.code();
+        let got_out = normalize(&String::from_utf8_lossy(&out_bytes));
+        let got_err = normalize(&String::from_utf8_lossy(&err_bytes));
         let want_out = stdouts.get(name).map(|s| normalize(s)).unwrap_or_default();
         let want_err = stderrs.get(name).map(|s| normalize(s)).unwrap_or_default();
         if got_code != want_code || got_out != want_out || got_err != want_err {
