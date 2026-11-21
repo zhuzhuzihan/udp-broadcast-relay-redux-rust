@@ -322,6 +322,15 @@ fn relay_one6(
                 iface.ifindex,
             ));
         }
+        // Degradation chain — Linux raw IPv6 (IPPROTO_RAW) defaults to hdrincl
+        // mode: the data IS the full IPv6 header+packet. Some kernels/LSMs
+        // reject that (EINVAL), so fall back to kernel-built headers:
+        //   1. bare full-header sendto (no ancillary data)
+        //   2. sendmsg UDP-segment + PKTINFO(source, ifindex) + HOPLIMIT
+        //   3. sendmsg UDP-segment + HOPLIMIT (kernel-picked source)
+        //   4. bare UDP-segment sendto (socket-level MULTICAST_HOPS)
+        crate::packet::forge6(gram, ttl, src_addr, group, src_port, opts.port, len);
+        let full = &gram[..crate::packet::V6HEADER_LEN + crate::packet::UDPHEADER_LEN + len];
         let seg = crate::packet::udp_segment6(
             src_addr,
             group,
@@ -329,34 +338,32 @@ fn relay_one6(
             opts.port,
             &gram[crate::packet::V6HEADER_LEN..crate::packet::V6HEADER_LEN + len],
         );
-        // Degradation chain for picky kernels (some reject PKTINFO sources or
-        // all ancillary data on raw IPv6 sockets):
-        //   1. PKTINFO(source, ifindex) + HOPLIMIT
-        //   2. PKTINFO(unspecified source, ifindex) + HOPLIMIT
-        //   3. bare sendto with destination scope_id + socket-level hops
-        let sent = sys::sendmsg6(
-            raw6.0,
-            &seg,
-            group,
-            opts.port,
-            ttl,
-            src_addr,
-            iface.ifindex as u32,
-            true,
-        )
-        .or_else(|_| {
-            sys::sendmsg6(
-                raw6.0,
-                &seg,
-                group,
-                opts.port,
-                ttl,
-                [0u8; 16],
-                iface.ifindex as u32,
-                false,
-            )
-        })
-        .or_else(|_| sys::sendto6(raw6.0, &seg, group, opts.port, iface.ifindex as u32));
+        let sent = sys::sendto6(raw6.0, full, group, opts.port, iface.ifindex as u32)
+            .or_else(|_| {
+                sys::sendmsg6(
+                    raw6.0,
+                    &seg,
+                    group,
+                    opts.port,
+                    ttl,
+                    src_addr,
+                    iface.ifindex as u32,
+                    true,
+                )
+            })
+            .or_else(|_| {
+                sys::sendmsg6(
+                    raw6.0,
+                    &seg,
+                    group,
+                    opts.port,
+                    ttl,
+                    [0u8; 16],
+                    iface.ifindex as u32,
+                    false,
+                )
+            })
+            .or_else(|_| sys::sendto6(raw6.0, &seg, group, opts.port, iface.ifindex as u32));
         match sent {
             Ok(_) => {
                 stats

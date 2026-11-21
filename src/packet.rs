@@ -90,6 +90,35 @@ pub fn udp_checksum(src: &[u8; 16], dst: &[u8; 16], udp: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Build a full IPv6 packet into the gram: fixed header + UDP with computed
+/// checksum. This is what Linux raw IPv6 sockets with IPPROTO_RAW expect in
+/// hdrincl mode (the default for IPPROTO_RAW): the kernel validates and
+/// routes the header itself, no ancillary data needed.
+pub fn forge6(
+    gram: &mut [u8; GRAM_SIZE],
+    hop_limit: u8,
+    from: [u8; 16],
+    to: [u8; 16],
+    from_port: u16,
+    to_port: u16,
+    payload_len: usize,
+) {
+    gram[0] = 0x60; // version 6, traffic class 0, flow label 0
+    gram[1..4].fill(0);
+    gram[4..6].copy_from_slice(&((UDPHEADER_LEN as u16) + payload_len as u16).to_be_bytes());
+    gram[6] = 17; // next header: UDP
+    gram[7] = hop_limit;
+    gram[8..24].copy_from_slice(&from);
+    gram[24..40].copy_from_slice(&to);
+    let seg_end = V6HEADER_LEN + UDPHEADER_LEN + payload_len;
+    gram[40..42].copy_from_slice(&from_port.to_be_bytes());
+    gram[42..44].copy_from_slice(&to_port.to_be_bytes());
+    gram[44..46].copy_from_slice(&((UDPHEADER_LEN as u16) + payload_len as u16).to_be_bytes());
+    gram[46..48].fill(0); // checksum field before computation
+    let seg = gram[40..seg_end].to_vec();
+    gram[46..48].copy_from_slice(&udp_checksum(&from, &to, &seg).to_be_bytes());
+}
+
 /// Build the UDP segment (header with checksum + payload) for a raw IPv6
 /// send. Linux IPv6 raw sockets do NOT accept a full IPv6 header — the kernel
 /// constructs it from the destination sockaddr plus IPV6_PKTINFO/IPV6_HOPLIMIT
