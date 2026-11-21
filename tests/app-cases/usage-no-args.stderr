@@ -1,0 +1,21 @@
+[..] [-d] [-f] [-s IP] [-t IP] [--id id] [--port udp-port] [--dev dev1]... [--multicast ip]...
+
+This program listens for broadcast  packets  on the  specified UDP port
+and then forwards them to each other given interface.  Packets are sent
+such that they appear to have come from the original broadcaster, resp.
+from the spoofing IP in case -s is used.  When using multiple instances
+for the same port on the same network, they must have a different id.
+
+    -d      enables debugging
+    -f      forces forking to background
+    -s IP   sets the source IP of forwarded packets; otherwise the
+            original sender's address is used.
+            Setting to 1.1.1.1 uses outgoing interface address and broadcast port.
+            (helps in some rare cases)
+            Setting to 1.1.1.2 uses outgoing interface address and source port.
+            (helps in some rare cases)
+    -t      sets the destination IP of forwarded packets; otherwise the
+            original target is used.
+            Setting to 255.255.255.255 uses the broadcast address of the
+            outgoing interface.
+

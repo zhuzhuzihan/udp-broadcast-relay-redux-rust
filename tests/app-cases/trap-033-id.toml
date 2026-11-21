@@ -1,0 +1,4 @@
+bin.name = "udp-broadcast-relay-redux"
+args = ["--id", "0", "--port", "9223372036854775807"]
+status.code = 1
+fs.sandbox = true

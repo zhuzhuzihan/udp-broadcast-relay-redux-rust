@@ -1,0 +1,20 @@
+[package]
+name = "udp-broadcast-relay-redux"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.70"
+license = "GPL-2.0-or-later"
+description = "Relays UDP broadcasts to other networks, forging the sender address (Rust port of udp-broadcast-relay-redux)"
+repository = "https://github.com/zhuzhuzihan/udp-broadcast-relay-redux-rust"
+homepage = "https://github.com/zhuzhuzihan/udp-broadcast-relay-redux-rust"
+keywords = ["network", "udp", "broadcast", "relay", "multicast"]
+categories = ["network-programming"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
