@@ -13,6 +13,7 @@
 mod cli;
 mod i18n;
 mod iface;
+mod log;
 mod out;
 mod packet;
 mod relay;
@@ -40,7 +41,67 @@ fn main() {
     let t = I18n::new(scan.lang);
     let mut out_stream = Out::new();
 
-    let opts = match cli::parse(&scan.program, &scan.args, &mut out_stream, &t) {
+    // Pre-scanned operational flags (new; never disturb the original's
+    // argument semantics). Order: log target → help → version → list.
+    let mut log_spec = None;
+    let mut help = false;
+    let mut version = false;
+    let mut list = false;
+    let mut selected_devs = std::collections::HashSet::new();
+    // Args the faithful parser still sees: everything except `--log` and its
+    // value (-h/--version/--list-interfaces short-circuit before parsing).
+    let mut work: Vec<String> = Vec::with_capacity(scan.args.len());
+    {
+        let args = &scan.args;
+        let mut i = 0usize;
+        while i < args.len() {
+            let a = args[i].as_str();
+            match a {
+                "--log" => {
+                    log_spec = args.get(i + 1).cloned();
+                    i += 2;
+                    continue; // stripped from the parser's view, value included
+                }
+                "-h" | "--help" => help = true,
+                "--version" => version = true,
+                "--list-interfaces" => list = true,
+                "--dev" => {
+                    if let Some(v) = args.get(i + 1) {
+                        selected_devs.insert(v.clone());
+                    }
+                }
+                _ => {}
+            }
+            work.push(args[i].clone());
+            i += 1;
+        }
+    }
+    if let Some(spec) = log_spec {
+        if let Err(_msg) = log::init(&spec, &scan.program) {
+            out::eprint_raw(&t.invalid_log(&spec));
+            std::process::exit(1);
+        }
+    }
+    if help {
+        out_stream.print(&t.extended_usage(&scan.program));
+        out_stream.flush();
+        std::process::exit(0);
+    }
+    if version {
+        out_stream.print(&format!(
+            "udp-broadcast-relay-redux {}\n",
+            env!("CARGO_PKG_VERSION")
+        ));
+        out_stream.flush();
+        std::process::exit(0);
+    }
+    if list {
+        out_stream.print(&iface::list_rows(&selected_devs, &t));
+        out_stream.flush();
+        std::process::exit(0);
+    }
+
+    let opts = match cli::parse(&scan.program, &work, &mut out_stream, &t) {
         Ok(o) => o,
         Err(code) => {
             out_stream.flush();

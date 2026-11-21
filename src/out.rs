@@ -36,17 +36,10 @@ impl Default for Out {
     }
 }
 
-/// Raw write to stderr (fd 2), ignoring errors (ADR-007).
+/// Emit a message line to the error channel (stderr default; routed through
+/// the global log when `--log` is set).
 pub fn eprint_raw(s: &str) {
-    let bytes = s.as_bytes();
-    let mut off = 0usize;
-    while off < bytes.len() {
-        let n = unsafe { libc::write(2, bytes[off..].as_ptr().cast(), bytes.len() - off) };
-        if n <= 0 {
-            break;
-        }
-        off += n as usize;
-    }
+    crate::log::note(s);
 }
 
 /// Current errno value.
@@ -63,9 +56,9 @@ pub fn strerror(err: i32) -> String {
     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
-/// C `perror(prefix)`: writes `prefix + ": " + strerror(errno) + "\n"` to stderr.
-/// The prefix may itself end in `\n` (the original does that); the output then
-/// spans two lines exactly like the C program.
+/// C `perror(prefix)`: writes `prefix + ": " + strerror(errno) + "\n"` to the
+/// error channel. The prefix may itself end in `\n` (the original does that);
+/// the output then spans two lines exactly like the C program.
 pub fn perror(prefix: &str, err: i32) {
-    eprint_raw(&format!("{prefix}: {}\n", strerror(err)));
+    crate::log::err(prefix, err);
 }

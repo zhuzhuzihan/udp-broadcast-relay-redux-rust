@@ -161,6 +161,77 @@ impl I18n {
         Self { lang }
     }
 
+    /// `-h/--help` output: the original usage text plus the new-flag section
+    /// (the bare usage stays byte-identical to the original, so only help
+    /// documents the additions).
+    pub fn extended_usage(&self, program: &str) -> String {
+        let base = self.usage(program);
+        match self.lang {
+            Lang::En => format!(
+                "{base}\nNew options:\n    -h, --help            show this help and exit\n    --version             show version and exit\n    --lang en|zh          user-facing message language (default: locale)\n    --list-interfaces     enumerate interfaces and exit (no root needed)\n    --log TARGET          error/log channel: stderr, syslog, file=PATH (default: stderr)\n\n"
+            ),
+            Lang::Zh => format!(
+                "{base}\n新增选项:\n    -h, --help            显示本帮助并退出\n    --version             显示版本号并退出\n    --lang en|zh          用户可见消息的语言（默认：跟随 locale）\n    --list-interfaces     枚举接口后退出（无需 root）\n    --log TARGET          错误/日志通道：stderr、syslog、file=PATH（默认 stderr）\n\n"
+            ),
+        }
+    }
+
+    pub fn invalid_log(&self, v: &str) -> String {
+        match self.lang {
+            Lang::En => format!("invalid log target: {v} (expected: stderr, syslog, file=PATH)\n"),
+            Lang::Zh => format!("无效的日志目标：{v}（可选：stderr、syslog、file=PATH）\n"),
+        }
+    }
+
+    pub fn list_header(&self) -> String {
+        match self.lang {
+            Lang::En => {
+                "name         idx  address        broadcast       state      selected\n".to_string()
+            }
+            Lang::Zh => {
+                "名称         序号  地址           广播/对端        状态       已选\n".to_string()
+            }
+        }
+    }
+
+    /// Data-heavy table rows keep their format in every language.
+    pub fn list_row(
+        &self,
+        name: &str,
+        idx: i32,
+        addr: &str,
+        dst: &str,
+        state: &str,
+        selected: &str,
+    ) -> String {
+        format!("{name:<12} {idx:<4} {addr:<14} {dst:<15} {state:<10} {selected}\n")
+    }
+
+    pub fn stats_dump(
+        &self,
+        received: u64,
+        forwarded: u64,
+        dropped_echo: u64,
+        dropped_nm: u64,
+        send_errors: u64,
+    ) -> String {
+        match self.lang {
+            Lang::En => format!(
+                "stats: received={received} forwarded={forwarded} dropped_echo={dropped_echo} dropped_not_managed={dropped_nm} send_errors={send_errors}\n"
+            ),
+            Lang::Zh => format!(
+                "统计：收到={received} 转发={forwarded} 回声丢弃={dropped_echo} 非托管丢弃={dropped_nm} 发送失败={send_errors}\n"
+            ),
+        }
+    }
+
+    pub fn stats_iface(&self, name: &str, sent: u64) -> String {
+        match self.lang {
+            Lang::En => format!("stats: iface {name} sent={sent}\n"),
+            Lang::Zh => format!("统计：接口 {name} 已发送={sent}\n"),
+        }
+    }
+
     pub fn invalid_lang(&self, v: &str) -> String {
         match self.lang {
             Lang::En => format!("invalid language: {v} (expected: en, zh)\n"),

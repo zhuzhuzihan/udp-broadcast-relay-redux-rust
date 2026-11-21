@@ -97,23 +97,6 @@ pub fn setsockopt_bind_to_device(fd: i32, name: &str) -> Result<(), std::io::Err
     }
 }
 
-/// Zeroed `struct ifreq` with the interface name copied in (strncpy semantics:
-/// truncate at 16 bytes, zero-pad the remainder — a 16+ char name stays
-/// unterminated, exactly like the original).
-fn make_ifreq(name: &str) -> libc::ifreq {
-    // SAFETY: ifreq is a plain-old-data C struct; zeroed is a valid all-zero value.
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = name.as_bytes();
-    let n = name_bytes.len().min(16);
-    // SAFETY: write name bytes into the fixed-size ifr_name array
-    // ([c_char; 16]; c_char and u8 share size/alignment).
-    unsafe {
-        let dst = req.ifr_name.as_mut_ptr().cast::<u8>();
-        std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), dst, n);
-    }
-    req
-}
-
 /// ioctl request argument type: `int` on musl, `unsigned long` elsewhere.
 #[cfg(target_env = "musl")]
 pub type IoctlReq = libc::c_int;
@@ -179,22 +162,6 @@ pub fn ioctl_ifreq(
     } else {
         Ok(())
     }
-}
-
-pub fn new_ifreq(name: &str) -> libc::ifreq {
-    make_ifreq(name)
-}
-
-/// Read the IPv4 address stored in a `struct sockaddr` (bytes 4..8, network order)
-/// as the numeric (host-assembled) form.
-///
-/// # Safety
-/// `sa` must point to at least 8 readable bytes of a sockaddr family record.
-pub unsafe fn sockaddr_to_addr(sa: &libc::sockaddr) -> u32 {
-    let b = sa.sa_data.as_ptr().cast::<u8>().add(2);
-    let mut four = [0u8; 4];
-    std::ptr::copy_nonoverlapping(b, four.as_mut_ptr(), 4);
-    u32::from_be_bytes(four)
 }
 
 /// `if_nametoindex` (BSD/macOS branch of the original).

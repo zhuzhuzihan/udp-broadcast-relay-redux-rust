@@ -86,10 +86,8 @@ pub fn run(
             for tag in signals.drain() {
                 match tag {
                     SIG_TERM | SIG_INT => shutdown = true,
-                    SIG_HUP | SIG_USR1 => {
-                        // Handled by the logging/stats layer (wave 2); ignored here.
-                        let _ = stats;
-                    }
+                    SIG_HUP => crate::log::reopen(),
+                    SIG_USR1 => dump_stats(ifaces, stats, t),
                     _ => {}
                 }
             }
@@ -128,6 +126,23 @@ pub fn run(
                 len,
                 stats,
             );
+        }
+    }
+}
+
+fn dump_stats(ifaces: &[Iface], stats: &Stats, t: &I18n) {
+    let g = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+    out::eprint_raw(&t.stats_dump(
+        g(&stats.received),
+        g(&stats.forwarded),
+        g(&stats.dropped_echo),
+        g(&stats.dropped_not_managed),
+        g(&stats.send_errors),
+    ));
+    for iface in ifaces {
+        let n = g(&iface.sent);
+        if n > 0 {
+            out::eprint_raw(&t.stats_iface(&iface.name, n));
         }
     }
 }
