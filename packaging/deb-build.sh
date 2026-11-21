@@ -45,4 +45,4 @@ EOF
 
 install -m 644 "$(dirname "$0")/../LICENSE" "$PKGROOT/usr/share/doc/${NAME}/copyright"
 
-dpkg-deb --root-owner-group --build "$PKGROOT"
+dpkg-deb --root-owner-group --build "$PKGROOT" "$(pwd)/${NAME}_${VER}_${ARCH}.deb"
