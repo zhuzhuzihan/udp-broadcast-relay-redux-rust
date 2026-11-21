@@ -39,6 +39,29 @@ jobs:
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "HOME=$HOME" \
             "$(which cargo)" test --release
+      # Live relay tests (tests/relay_e2e.rs, --ignored): real sockets on real
+      # interfaces. They run AFTER the behavior suite because they give dummy0
+      # an address, which the recorded suite forbids.
+      - name: Prepare e2e interfaces
+        run: |
+          sudo ip link add dummy1 type dummy 2>/dev/null || true
+          sudo ip addr add 10.55.0.1/24 dev dummy0 2>/dev/null || true
+          sudo ip addr add 10.66.0.1/24 dev dummy1 2>/dev/null || true
+          sudo ip -6 addr add fd00:55::1/64 dev dummy0 2>/dev/null || true
+          sudo ip -6 addr add fd00:66::1/64 dev dummy1 2>/dev/null || true
+          sudo ip link set dummy0 up 2>/dev/null || true
+          sudo ip link set dummy1 up 2>/dev/null || true
+      - name: Live relay e2e (v4 + v6, needs root)
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=$CARGO_HOME" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "HOME=$HOME" \
+            "$(which cargo)" test --release -- --ignored
+      - name: Cleanup e2e interfaces
+        if: always()
+        run: sudo ip link del dummy1 2>/dev/null || true
       - name: Fix target ownership
         if: always()
         run: sudo chown -R $(id -u):$(id -g) target

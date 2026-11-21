@@ -1,0 +1,131 @@
+.\" Manual page for udp-broadcast-relay-redux (Rust port)
+.\" GPL-2.0-or-later
+.TH UDP-BROADCAST-RELAY-REDUX 1 "2026-11-21" "udp-broadcast-relay-redux 1.1" "User Commands"
+.SH NAME
+udp-broadcast-relay-redux \- relay UDP broadcasts (and IPv6 multicast) to other networks, forging the sender address
+.SH SYNOPSIS
+.B udp-broadcast-relay-redux
+.RB [ \-d ]
+.RB [ \-f ]
+.RB [ \-s\ \fIIP\fR ]
+.RB [ \-t\ \fIIP\fR ]
+.RB [ --id\ \fIid\fR ]
+.RB [ --port\ \fIudp-port\fR ]
+.RB [ --dev\ \fIdev1\fR ]...
+.RB [ --multicast\ \fIip\fR ]...
+.RB [ --lang\ \fIen|zh\fR ]
+.RB [ --log\ \fITARGET\fR ]
+.RB [ --ipv6 ]
+.RB [ --list-interfaces ]
+.RB [ -h | --help ]
+.RB [ --version ]
+.SH DESCRIPTION
+.B udp-broadcast-relay-redux
+listens for broadcast packets on the specified UDP port and forwards them to
+each other given interface. Packets are sent such that they appear to have
+come from the original broadcaster, or from the spoofing IP if
+.B \-s
+is used. When running multiple instances for the same port on the same
+network, each must have a different
+.B id
+(it is encoded as IP TTL 64+id, which also identifies relay echoes).
+.P
+This is the Rust port of the C original with identical default behavior,
+plus internationalization, graceful signals, interface hot-plug following
+(Linux) and an opt-in IPv6 multicast relay.
+.SH OPTIONS
+.TP
+.B \-d
+Enable debugging output (goes to stdout).
+.TP
+.B \-f
+Fork to background. The parent exits immediately; in non-debug mode the
+daemon closes its standard streams.
+.TP
+.BI \-s " IP"
+Set the source IP of forwarded packets. The special values
+.B 1.1.1.1
+(use outgoing interface address + broadcast port) and
+.B 1.1.1.2
+(outgoing interface address + original source port) are honored as in the
+original.
+.TP
+.BI \-t " IP"
+Set the destination IP of forwarded packets.
+.B 255.255.255.255
+means the outgoing interface's broadcast address.
+.TP
+.BI --id " id"
+Instance id, 1–99.
+.TP
+.BI --port " udp-port"
+UDP port to listen on (1–65535).
+.TP
+.BI --dev " dev1"
+Interface to manage. Repeat for several interfaces. Interfaces that do not
+exist yet are picked up by the hot-plug monitor (Linux) as long as at least
+one requested interface exists at startup.
+.TP
+.BI --multicast " ip"
+Join this multicast group on every managed interface. Repeatable; IPv6
+groups (containing ':') require
+.BR --ipv6 .
+.TP
+.BI --lang " en|zh"
+Language of user-facing messages. Defaults to the
+.BR LC_ALL / LC_MESSAGES / LANG
+locale. English output is byte-identical to the C original.
+.TP
+.BI --log " TARGET"
+Error/log channel:
+.B stderr
+(default; byte-faithful),
+.BR syslog ,
+or
+.BI file= PATH
+(append; reopen on SIGHUP).
+.TP
+.B --ipv6
+Also relay IPv6 multicast groups on the same port (dual-stack receive).
+.TP
+.B --list-interfaces
+Enumerate candidate interfaces with their addresses and selection state,
+then exit. Does not require root.
+.TP
+.B \-h\fR, \fB\-\-help
+Show the full help and exit.
+.TP
+.B --version
+Show version and exit.
+.SH SIGNALS
+.TP
+.B SIGTERM\fR, \fBSIGINT
+Graceful shutdown (exit 0).
+.TP
+.B SIGHUP
+Reopen the log file (rotation) when
+.B --log file=
+is used.
+.TP
+.B SIGUSR1
+Dump packet counters (received, forwarded, dropped, per-interface sent).
+.SH EXAMPLES
+.TP
+HDHomeRun discovery across two interfaces:
+.B udp-broadcast-relay-redux --id 1 --port 65001 --dev eth0 --dev wlan0 --multicast 239.255.255.250
+.TP
+SSDP relay with Chinese messages and syslog:
+.B udp-broadcast-relay-redux --lang zh --log syslog --id 2 --port 1900 --dev br-lan --dev eth1 --multicast 239.255.255.250
+.SH REQUIRES
+Root privileges (raw sockets). Linux; macOS supported via the BSD code path
+(compile-checked), FreeBSD experimental.
+.SH AUTHOR
+UDP Broadcast Relay Redux Contributors; Joachim Breitner; Nathan
+O'Sullivan. Rust port and i18n additions by the
+udp-broadcast-relay-redux-rust contributors.
+.SH LICENSE
+GPL-2.0-or-later; see LICENSE.
+.SH SEE ALSO
+Project repository and behavior-port documentation:
+.UR https://github.com/zhuzhuzihan/udp-broadcast-relay-redux-rust
+.UE .

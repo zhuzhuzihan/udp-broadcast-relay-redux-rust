@@ -43,11 +43,46 @@ jobs:
           mkdir -p "$dir"
           cp target/${{ matrix.target }}/release/udp-broadcast-relay-redux "$dir/"
           cp README.md README.zh-CN.md LICENSE "$dir/"
+          mkdir -p "$dir/completions" "$dir/man"
+          cp completions/* "$dir/completions/" 2>/dev/null || true
+          cp docs/udp-broadcast-relay-redux.1 "$dir/man/" 2>/dev/null || true
           tar czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+      - name: Build Debian package (x86_64 gnu only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          chmod +x packaging/deb-build.sh
+          packaging/deb-build.sh \
+            target/x86_64-unknown-linux-gnu/release/udp-broadcast-relay-redux \
+            "${GITHUB_REF_NAME#v}"
+          mv udp-broadcast-relay-redux_*.deb ./
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          name: udp-broadcast-relay-redux-amd64.deb
+          path: udp-broadcast-relay-redux_*.deb
+          if-no-files-found: ignore
+      - uses: softprops/action-gh-release@v2
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          files: udp-broadcast-relay-redux_*.deb
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             udp-broadcast-relay-redux-*.tar.gz
             udp-broadcast-relay-redux-*.tar.gz.sha256
           generate_release_notes: true
+
+  crates-io:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    needs: release
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish (skipped when no token is configured)
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked

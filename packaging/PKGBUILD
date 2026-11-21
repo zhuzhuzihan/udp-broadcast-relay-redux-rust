@@ -1,0 +1,38 @@
+# Maintainer: zhuzhuzihan <zhuzhuzihan@users.noreply.github.com>
+# AUR package definition for udp-broadcast-relay-redux (Rust port).
+# To publish: create an AUR account, clone aur:udp-broadcast-relay-redux,
+# copy this PKGBUILD + .SRCINFO there, commit and push.
+# Generate .SRCINFO with: makepkg --printsrcinfo > .SRCINFO
+
+pkgname=udp-broadcast-relay-redux
+pkgver=1.1.0
+pkgrel=1
+pkgdesc="Relay UDP broadcasts to other networks, forging the sender address (Rust port, en/zh i18n)"
+url="https://github.com/zhuzhuzihan/udp-broadcast-relay-redux-rust"
+license=("GPL-2.0-or-later")
+arch=("aarch64" "x86_64")
+makedepends=("cargo")
+depends=("glibc")
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=("SKIP") # replace with the release checksum before publishing
+
+build() {
+    cd "$pkgname-$pkgver"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "$srcdir/target/release/udp-broadcast-relay-redux" \
+        "$pkgdir/usr/bin/udp-broadcast-relay-redux"
+    install -Dm644 "docs/udp-broadcast-relay-redux.1" \
+        "$pkgdir/usr/share/man/man1/udp-broadcast-relay-redux.1"
+    install -Dm644 "completions/udp-broadcast-relay-redux.bash" \
+        "$pkgdir/usr/share/bash-completion/completions/udp-broadcast-relay-redux"
+    install -Dm644 "completions/_udp-broadcast-relay-redux.zsh" \
+        "$pkgdir/usr/share/zsh/functions/Completion/Unix/_udp-broadcast-relay-redux"
+    install -Dm644 "completions/udp-broadcast-relay-redux.fish" \
+        "$pkgdir/usr/share/fish/vendor_completions.d/udp-broadcast-relay-redux.fish"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

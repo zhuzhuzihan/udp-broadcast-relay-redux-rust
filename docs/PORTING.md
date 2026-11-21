@@ -104,6 +104,27 @@ current contract:
   have no IPv4 address; CI recreates it (`ip link add dummy0 type dummy`).
   Two cases need CAP_NET_RAW, so the suite runs as root in CI.
 
+## 5b. IPv6 relay (`--ipv6`) — v1.1 findings
+
+- **Linux IPv6 raw sockets have no full-header mode** (unlike IPv4 IP_HDRINCL):
+  the kernel always builds the IPv6 header. The send path therefore builds a
+  UDP segment (`packet::udp_segment6`, checksum computed over the pseudo-header)
+  and uses sendmsg with ancillary data: `IPV6_PKTINFO` (source address +
+  outgoing ifindex) and `IPV6_HOPLIMIT` (= 64+id for echo suppression).
+- **cmsg buffers must be aligned to sizeof(long)** (8 on 64-bit) — a 4-byte
+  alignment makes sendmsg fail with EINVAL.
+- **Embedded kernels vary**: an Android kernel observed in the lab lacks
+  `IPV6_ADD_MEMBERSHIP` (opt 20) but accepts the BSD number `IPV6_JOIN_GROUP`
+  (12) — sys::join6 falls back on ENOPROTOOPT. `SO_BINDTODEVICE` and
+  `IP_TRANSPARENT` may also be missing there; both are non-fatal
+  (SO_BINDTODEVICE loss just means routing-table-dependent egress).
+- **Live 2-interface check blocked in the lab**: this sandbox kernel rejects
+  every raw IPv6 sendto/sendmsg with EINVAL (verified with independent python
+  probes — plain UDP6 works), and `ip -6 addr add` returns EPERM. The
+  datapath was verified up to the kernel boundary (receive, cmsg parsing,
+  echo detection, counters); the full live loop runs in CI (ubuntu kernels
+  have working raw IPv6) via `tests/relay_e2e.rs` (`--ignored` tests).
+
 ## 6. Cross-platform compile status (cargo check)
 
 | Target | Result |

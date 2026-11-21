@@ -39,13 +39,32 @@ same network, they must have a different id.
 | `--port udp-port` | UDP port to listen on |
 | `--dev dev1` | interface to manage (repeatable) |
 | `--multicast ip` | multicast group to join on every managed interface (repeatable) |
-| `--lang en\|zh` | user-facing message language (new; see [i18n](#internationalization)) |
+| `--lang en\|zh` | user-facing message language (see [i18n](#internationalization)) |
+| `--log stderr\|syslog\|file=PATH` | error/log channel (default: stderr, byte-faithful) |
+| `--ipv6` | also relay IPv6 multicast groups on the same port |
+| `--list-interfaces` | enumerate candidate interfaces and exit (no root) |
+| `-h`/`--help`, `--version` | help (bilingual) and version |
 
 Requires root (raw sockets). HDHomeRun example:
 
 ```
 udp-broadcast-relay-redux --id 1 --port 65001 --dev eth0 --dev wlan0 --multicast 239.255.255.250
 ```
+
+## What's new in 1.1
+
+- **Reliability fixes**: duplicate `--dev`/multicast joins no longer forward
+  duplicates or crash with `EADDRINUSE`; zero usable interfaces fails fast
+  instead of becoming a zombie daemon; SIGTERM/SIGINT shut down gracefully.
+- **Interface hot-plug (Linux)**: interfaces matching `--dev` that appear,
+  disappear or change addresses while the daemon runs are picked up and
+  released automatically (netlink).
+- **`--ipv6`**: dual-stack relay for IPv6 multicast groups (UDP checksum
+  computed locally; hop limit 64+id identifies echoes).
+- **Strict parsing**: `--id`/`--port` values outside 1–99 / 1–65535 are now
+  clear errors instead of silent integer truncation.
+- **Operations**: `--log syslog|file=`, SIGUSR1 packet counters, bilingual
+  `--help`, man page and shell completions.
 
 ## Internationalization
 
@@ -62,12 +81,20 @@ English output is byte-identical to the C original. See
 
 ## Install
 
-Prebuilt binaries (linux x86_64/aarch64 gnu+musl, macOS aarch64) are attached
-to every GitHub release, or build from source:
+Prebuilt binaries (linux x86_64/aarch64 gnu+musl, macOS aarch64), a Debian
+package and man page + completions are attached to every GitHub release; also
+buildable from source:
 
 ```
 cargo build --release
 ```
+
+- Debian: `dpkg -i udp-broadcast-relay-redux_<version>_amd64.deb`
+- AUR: use `packaging/PKGBUILD` (see the file header for publishing steps)
+- Homebrew: create a tap from `packaging/homebrew/udp-broadcast-relay-redux.rb`
+- crates.io: release CI runs `cargo publish` when the
+  `CARGO_REGISTRY_TOKEN` secret is configured, then
+  `cargo install udp-broadcast-relay-redux` works
 
 Docker:
 
@@ -88,7 +115,8 @@ The port was driven by [rust-anything](https://github.com/erkamyaman/rust-anythi
   forged packets produced by the Rust port and the C original were captured
   with AF_PACKET and compared field by field (source/destination/ports/TTL/
   payload) across broadcast, unicast, multicast, spoof and target-rewrite
-  scenarios — identical output.
+  scenarios — identical output. The same batteries live in
+  `tests/relay_e2e.rs` and run in CI (v4 always, v6 on IPv6-capable runners).
 - Faithfully preserved quirks include: `Debugging Mode enabled` never prints
   (the original's DPRINT evaluates `debug` before setting it), glibc
   `atoi`/`inet_addr` semantics incl. octal/hex/overflow handling, u8/u16
