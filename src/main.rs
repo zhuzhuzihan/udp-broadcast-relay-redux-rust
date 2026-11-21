@@ -11,6 +11,7 @@
 //! GPL-2.0-or-later (see LICENSE).
 
 mod cli;
+#[cfg(target_os = "linux")]
 mod event;
 mod i18n;
 mod iface;

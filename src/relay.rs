@@ -4,6 +4,7 @@
 
 use crate::cli;
 use crate::cli::{Options, INADDR_BROADCAST, SPOOF_IFACE_BCAST_PORT, SPOOF_IFACE_SRC_PORT};
+#[cfg(target_os = "linux")]
 use crate::event::{self, Action, ManagedInfo};
 use crate::i18n::{ipv4_str, I18n};
 use crate::iface;
@@ -124,6 +125,7 @@ pub fn run(
             }
         }
 
+        #[cfg(target_os = "linux")]
         if let (true, Some(nl)) = (
             idx_nl.is_some_and(|i| pollfds[i].revents & libc::POLLIN != 0),
             netlink,
@@ -387,6 +389,7 @@ fn relay_one6(
 }
 
 /// Execute hot-plug actions: probe + create + join for Add, close for Remove.
+#[cfg(target_os = "linux")]
 #[expect(clippy::too_many_arguments, reason = "executor needs both stacks")]
 fn apply_actions(
     actions: &[Action],
