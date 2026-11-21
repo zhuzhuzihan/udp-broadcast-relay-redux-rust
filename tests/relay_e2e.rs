@@ -277,7 +277,7 @@ fn v6_multicast_relay_between_dummy_interfaces() {
             "ff0e::e2e",
         ])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn relay");
     std::thread::sleep(Duration::from_millis(500));
@@ -333,6 +333,10 @@ fn v6_multicast_relay_between_dummy_interfaces() {
     if let Some(mut out) = relay.stdout.take() {
         use std::io::Read;
         let _ = out.read_to_string(&mut dbg);
+    }
+    if let Some(mut err) = relay.stderr.take() {
+        use std::io::Read;
+        let _ = err.read_to_string(&mut dbg);
     }
     let _ = relay.wait();
 
